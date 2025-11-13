@@ -49,10 +49,11 @@ fi
 # === STEP 04: Clone Testnet Node Repo ===
 if [ ! -f "$MARKER_DIR/04_clone_repo.done" ]; then
   echo -e "\e[91m[STEP 04] Cloning Testnet Node repository...\e[0m"
-  if [ ! -d "/opt/demos-node/.git" ]; then
-    git clone https://github.com/kynesyslabs/node.git /opt/demos-node
-  else
+  if [ -d "/opt/demos-node/.git" ]; then
     echo -e "\e[91m[STEP 04] Repo already exists at /opt/demos-node. Skipping clone.\e[0m"
+  else
+    rm -rf /opt/demos-node 2>/dev/null || true
+    git clone https://github.com/kynesyslabs/node.git /opt/demos-node
   fi
   cd /opt/demos-node
   bun install
