@@ -107,3 +107,4 @@ chown root:root "$MONITOR_LOG" || true
 chmod 644 "$MONITOR_LOG" || true
 
 echo "✅ Helpers installed to $HELPER_DIR and symlinked to $GLOBAL_BIN"
+
