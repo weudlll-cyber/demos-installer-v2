@@ -1,10 +1,12 @@
 #!/bin/bash
-set -euo pipefail
+set -e
 IFS=$'\n\t'
 
-# install_helpers.sh
-# Creates helper scripts in /root/demos_helpers and symlinks them into /usr/local/bin
-# Usage: bash /root/demos_helpers/install_helpers.sh
+# Ensure we're using Bash
+if [ -z "$BASH_VERSION" ]; then
+  echo "❌ This script must be run with bash. Try: bash install_helpers_v1.sh"
+  exit 1
+fi
 
 HELPER_DIR="/root/demos_helpers"
 GLOBAL_BIN="/usr/local/bin"
@@ -15,7 +17,7 @@ mkdir -p "$HELPER_DIR" "$GLOBAL_BIN" || true
 # restart helper
 cat > "$HELPER_DIR/restart_demos_node.sh" <<'EOF'
 #!/bin/bash
-set -euo pipefail
+set -e
 systemctl restart demos-node.service
 systemctl status demos-node.service --no-pager -l
 EOF
@@ -24,7 +26,7 @@ chmod 755 "$HELPER_DIR/restart_demos_node.sh"
 # backup keys
 cat > "$HELPER_DIR/backup_demos_keys.sh" <<'EOF'
 #!/bin/bash
-set -euo pipefail
+set -e
 mkdir -p ~/demos-keys
 cp /root/node/publickey ~/demos-keys/publickey 2>/dev/null || true
 cp /root/node/privatekey ~/demos-keys/privatekey 2>/dev/null || true
@@ -36,7 +38,7 @@ chmod 700 "$HELPER_DIR/backup_demos_keys.sh"
 # stop helper
 cat > "$HELPER_DIR/stop_demos_node.sh" <<'EOF'
 #!/bin/bash
-set -euo pipefail
+set -e
 systemctl stop demos-node.service || true
 systemctl disable --now demos-node.service || true
 pgrep -f "/root/node" | xargs -r sudo kill -9 || true
@@ -53,7 +55,7 @@ chmod 755 "$HELPER_DIR/stop_demos_node.sh"
 # health-check script
 cat > "$HELPER_DIR/check_demos_node.sh" <<'EOF'
 #!/bin/bash
-set -euo pipefail
+set -e
 NODE_DIR="/root/node"
 SERVICE="demos-node.service"
 MON_LOG="/var/log/demos_node_monitor.log"
@@ -102,4 +104,4 @@ chmod 755 "$GLOBAL_BIN/restart_demos_node" "$GLOBAL_BIN/backup_demos_keys" "$GLO
 # Ensure monitor log exists
 touch "$MONITOR_LOG" || true; chown root:root "$MONITOR_LOG" || true; chmod 644 "$MONITOR_LOG" || true
 
-echo "Helpers installed to $HELPER_DIR and symlinked to $GLOBAL_BIN"
+echo "✅ Helpers installed to $HELPER_DIR and symlinked to $GLOBAL_BIN"
