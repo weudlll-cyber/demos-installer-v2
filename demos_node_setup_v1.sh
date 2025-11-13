@@ -100,8 +100,13 @@ fi
 
 # === STEP 07: Reboot Once ===
 if [ ! -f "$MARKER_DIR/07_reboot_once.done" ]; then
-  echo -e "\e[91m[STEP 07] Rebooting system to finalize setup...\e[0m"
-  echo -e "\e[91mThis reboot is required to apply kernel updates and finalize installation.\e[0m"
+  echo -e "\e[91m[STEP 07] WARNING: System will reboot in 10 seconds to apply kernel updates and finalize setup.\e[0m"
+  echo -e "\e[91mAfter reboot, the Demos Node will start automatically as a systemd service.\e[0m"
+  echo -e "\e[91mTo check node status, use:\e[0m check_demos_node --status"
+  echo -e "\e[91mTo view logs, use:\e[0m check_demos_node --logs=50"
+  echo -e "\e[91mTo run a full health check, use:\e[0m check_demos_node --health"
+  echo -e "\e[91mTo auto-restart if unhealthy, use:\e[0m check_demos_node --autorestart"
+  sleep 10
   touch "$MARKER_DIR/07_reboot_once.done"
   reboot
 else
