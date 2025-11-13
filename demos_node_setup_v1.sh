@@ -45,10 +45,10 @@ else
   echo -e "\e[91m[STEP 03] Already completed.\e[0m"
 fi
 
-# === STEP 04: Clone Demos Node Repo ===
+# === STEP 04: Clone Testnet Node Repo ===
 if [ ! -f "$MARKER_DIR/04_clone_repo.done" ]; then
-  echo -e "\e[91m[STEP 04] Cloning Demos Node repository...\e[0m"
-  git clone https://github.com/weudl/demos-node /opt/demos-node
+  echo -e "\e[91m[STEP 04] Cloning Testnet Node repository...\e[0m"
+  git clone https://github.com/kynesyslabs/node.git /opt/demos-node
   cd /opt/demos-node
   bun install
   touch "$MARKER_DIR/04_clone_repo.done"
