@@ -48,7 +48,14 @@ fi
 # === Configure .env ===
 if [ ! -f .env ]; then
   echo -e "\e[91m🔧 Generating .env configuration...\e[0m"
-  cp /opt/demos-node/env.example .env
+
+  if [ -f /opt/demos-node/env.example ]; then
+    cp /opt/demos-node/env.example .env
+    echo -e "\e[91m✅ Loaded template from /opt/demos-node/env.example\e[0m"
+  else
+    echo -e "\e[91m⚠️ env.example not found. Creating a basic .env manually...\e[0m"
+    touch .env
+  fi
 
   PUBLIC_IP=$(curl -s ifconfig.me || echo "localhost")
   DEFAULT_URL="http://$PUBLIC_IP:$CUSTOM_NODE_PORT"
