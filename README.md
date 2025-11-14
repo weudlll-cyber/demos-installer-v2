@@ -53,49 +53,51 @@ Shows:
 - Recovery hints and restart suggestions
 
 🔄 Restart Node
-```restart_demos_node```
+```bash
+restart_demos_node```
 
 
 Restarts the systemd service and confirms success.
 
 📊 Unified Log & Health Tool
-```logs_demos_node --status```
-
-
+```bash
+logs_demos_node --status```
 Shows systemd status and PID.
-```logs_demos_node --logs=100```
 
-
+```bash
+logs_demos_node --logs=100```
 Shows the last 100 lines of logs.
+
 ```logs_demos_node --health```
-
-
 Performs a full health check:
 - Systemd status + explanation
 - PID check
 - HTTP endpoint check
 - Auto-repair if service is inactive or failed
-```logs_demos_node --autorestart```
 
 
+```bash
+logs_demos_node --autorestart```
 Restarts the node only if unhealthy.
 
-```logs_demos_node --restart```
-
-
+```bash
+logs_demos_node --restart```
 Force restarts the node.
 
 🧪 Recovery Tips
 If something fails:
-```sudo bash demos_node_setup_v1.sh```
+```bash
+sudo bash demos_node_setup_v1.sh```
 
 
 Check logs:
-```sudo journalctl -u demos-node --no-pager --since "10 minutes ago"```
+```bash
+sudo journalctl -u demos-node --no-pager --since "10 minutes ago"```
 
 
 Restart manually:
-```sudo systemctl restart demos-node```
+```bash
+sudo systemctl restart demos-node```
 
 
 ```
