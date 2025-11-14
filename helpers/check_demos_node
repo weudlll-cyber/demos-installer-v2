@@ -4,7 +4,7 @@
 
 set -euo pipefail
 IFS=$'\n\t'
-set -x
+
 SERVICE_NAME="demos-node"
 HTTP_ENDPOINT="http://localhost:8080/health"  # Optional: adjust if your node exposes a health route
 
@@ -33,7 +33,8 @@ fi
 
 # === Get systemd status and PID ===
 STATUS=$(systemctl is-active "$SERVICE_NAME")
-PID=$(systemctl show -p MainPID "$SERVICE_NAME" | cut -d= -f2)
+PID=$(systemctl show -p MainPID "$SERVICE_NAME" | cut -d= -f2 || echo 0)
+PID=${PID:-0}
 
 echo -e "\e[91m🧠 Systemd Status: $STATUS\e[0m"
 case "$STATUS" in
@@ -64,7 +65,7 @@ case "$STATUS" in
 esac
 
 # === PID check ===
-if [ "$PID" -gt 0 ]; then
+if [[ "$PID" =~ ^[0-9]+$ ]] && [ "$PID" -gt 0 ]; then
   echo -e "\e[91m🧬 Main PID: $PID\e[0m"
   echo -e "\e[91m✅ The process is alive and tracked by systemd.\e[0m"
 else
