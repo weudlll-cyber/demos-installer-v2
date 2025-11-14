@@ -71,7 +71,8 @@ logs_demos_node --logs=100
 ```
 Shows the last 100 lines of logs.
 
-```logs_demos_node --health
+```bash
+logs_demos_node --health
 ```
 Performs a full health check:
 - Systemd status + explanation
