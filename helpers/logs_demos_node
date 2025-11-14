@@ -89,7 +89,9 @@ check_health() {
 }
 
 # === Main ===
-case "${1:-"--status"}" in
+COMMAND="${1:---status}"
+
+case "$COMMAND" in
   --status)
     STATUS=$(systemctl is-active "$UNIT_NAME")
     PID=$(systemctl show -p MainPID "$UNIT_NAME" | cut -d= -f2 || echo 0)
@@ -99,7 +101,7 @@ case "${1:-"--status"}" in
     ;;
 
   --logs=*)
-    COUNT="${1#--logs=}"
+    COUNT="${COMMAND#--logs=}"
     echo -e "\e[91m📜 Showing last $COUNT lines of logs...\e[0m"
     journalctl -u "$UNIT_NAME" --no-pager -n "$COUNT"
     ;;
@@ -123,7 +125,7 @@ case "${1:-"--status"}" in
     ;;
 
   *)
-    echo -e "\e[91m❌ Unknown command: $1\e[0m"
+    echo -e "\e[91m❌ Unknown command: $COMMAND\e[0m"
     echo -e "\e[91mUsage:\e[0m"
     echo -e "\e[91m  logs_demos_node --status\e[0m"
     echo -e "\e[91m  logs_demos_node --logs=100\e[0m"
