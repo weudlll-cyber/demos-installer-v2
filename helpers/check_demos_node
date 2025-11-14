@@ -1,0 +1,39 @@
+#!/bin/bash
+# This helper script checks the status of the Demos Node systemd service.
+# It provides a clear summary of whether the node is running, inactive, or failed.
+
+set -euo pipefail
+IFS=$'\n\t'
+
+SERVICE_NAME="demos-node"
+
+echo -e "\e[91m🔍 Checking status of Demos Node service: $SERVICE_NAME\e[0m"
+
+# === Check if systemd is available ===
+if ! command -v systemctl &>/dev/null; then
+  echo -e "\e[91m❌ systemctl not found. This system may not support systemd.\e[0m"
+  exit 1
+fi
+
+# === Check if service exists ===
+if ! systemctl list-units --type=service --all | grep -q "$SERVICE_NAME"; then
+  echo -e "\e[91m❌ Service $SERVICE_NAME not found.\e[0m"
+  echo -e "\e[91mMake sure the node was installed and the service was created.\e[0m"
+  exit 1
+fi
+
+# === Get service status ===
+STATUS=$(systemctl is-active "$SERVICE_NAME")
+if [ "$STATUS" = "active" ]; then
+  echo -e "\e[91m✅ Demos Node is running.\e[0m"
+elif [ "$STATUS" = "inactive" ]; then
+  echo -e "\e[91m⚠️ Demos Node is installed but not running.\e[0m"
+  echo -e "\e[91mYou can start it with:\e[0m"
+  echo -e "\e[91msudo systemctl start $SERVICE_NAME\e[0m"
+elif [ "$STATUS" = "failed" ]; then
+  echo -e "\e[91m❌ Demos Node service has failed.\e[0m"
+  echo -e "\e[91mCheck logs:\e[0m"
+  echo -e "\e[91msudo journalctl -u $SERVICE_NAME --no-pager --since \"10 minutes ago\"\e[0m"
+else
+  echo -e "\e[91m❓ Unknown service status: $STATUS\e[0m"
+fi
