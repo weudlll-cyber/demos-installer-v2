@@ -1,0 +1,39 @@
+#!/bin/bash
+# This helper script shows recent logs from the Demos Node systemd service.
+# It helps users quickly debug or monitor the node's behavior.
+
+set -euo pipefail
+IFS=$'\n\t'
+
+SERVICE_NAME="demos-node"
+
+echo -e "\e[91m📜 Showing recent logs for Demos Node service: $SERVICE_NAME\e[0m"
+
+# === Check if systemd is available ===
+if ! command -v systemctl &>/dev/null; then
+  echo -e "\e[91m❌ systemctl not found. This system may not support systemd.\e[0m"
+  exit 1
+fi
+
+# === Check if journalctl is available ===
+if ! command -v journalctl &>/dev/null; then
+  echo -e "\e[91m❌ journalctl not found. Cannot display logs.\e[0m"
+  echo -e "\e[91mMake sure systemd-journald is installed and available.\e[0m"
+  exit 1
+fi
+
+# === Check if service exists ===
+if ! systemctl list-units --type=service --all | grep -q "$SERVICE_NAME"; then
+  echo -e "\e[91m❌ Service $SERVICE_NAME not found.\e[0m"
+  echo -e "\e[91mMake sure the node was installed and the service was created.\e[0m"
+  exit 1
+fi
+
+# === Show logs from the last 10 minutes ===
+echo -e "\e[91m🕒 Logs from the last 10 minutes:\e[0m"
+journalctl -u "$SERVICE_NAME" --no-pager --since "10 minutes ago" || {
+  echo -e "\e[91m❌ Failed to retrieve logs.\e[0m"
+  echo -e "\e[91mTry manually:\e[0m"
+  echo -e "\e[91msudo journalctl -u $SERVICE_NAME --no-pager --since \"10 minutes ago\"\e[0m"
+  exit 1
+}
