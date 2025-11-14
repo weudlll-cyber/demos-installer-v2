@@ -38,7 +38,7 @@ declare -A VERSION_MAP=(
 )
 
 # === Script Source URL ===
-SCRIPT_BASE_URL="https://raw.githubusercontent.com/weudlll-cyber/demos-installer-v2/main"
+SCRIPT_BASE_URL="https://raw.githubusercontent.com/weudlll-cyber/demos-installer-v2/main/scripts"
 
 # === Function: Fetch or Update Script ===
 fetch_or_update_script() {
