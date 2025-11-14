@@ -18,9 +18,12 @@ if [ -f "$STEP_MARKER" ]; then
   exit 0
 fi
 
-# === Check for Bun ===
+# === Ensure Bun is available in PATH ===
+export PATH="/root/.bun/bin:$PATH"
+
 if ! command -v bun &>/dev/null; then
-  echo -e "\e[91m❌ Bun is not available. Required for dependency installation.\e[0m"
+  echo -e "\e[91m❌ Bun is not available in PATH.\e[0m"
+  echo -e "\e[91mMake sure Bun was installed correctly in step 03.\e[0m"
   echo -e "\e[91mRun the installer again to complete Bun setup:\e[0m"
   echo -e "\e[91msudo bash demos_node_setup_v1.sh\e[0m"
   exit 1
@@ -44,14 +47,19 @@ fi
 # === Install dependencies ===
 echo -e "\e[91m📦 Installing dependencies with Bun...\e[0m"
 cd /opt/demos-node
-bun install || {
-  echo -e "\e[91m❌ bun install failed.\e[0m"
-  echo -e "\e[91mTry manually:\e[0m"
-  echo -e "\e[91mcd /opt/demos-node && bun install\e[0m"
-  echo -e "\e[91mThen restart the installer:\e[0m"
-  echo -e "\e[91msudo bash demos_node_setup_v1.sh\e[0m"
-  exit 1
-}
+
+if [ -f "bun.lockb" ] || [ -f "package.json" ]; then
+  bun install || {
+    echo -e "\e[91m❌ bun install failed.\e[0m"
+    echo -e "\e[91mTry manually:\e[0m"
+    echo -e "\e[91mcd /opt/demos-node && bun install\e[0m"
+    echo -e "\e[91mThen restart the installer:\e[0m"
+    echo -e "\e[91msudo bash demos_node_setup_v1.sh\e[0m"
+    exit 1
+  }
+else
+  echo -e "\e[91m⚠️ No bun.lockb or package.json found. Skipping install.\e[0m"
+fi
 
 # === Trust dependencies ===
 echo -e "\e[91m🔐 Trusting Bun dependencies...\e[0m"
