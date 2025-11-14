@@ -7,6 +7,25 @@ echo -e "\e[91mStarting Demos Node Installer...\e[0m"
 MARKER_DIR="/root/.demos_node_setup"
 mkdir -p "$MARKER_DIR"
 
+# === STEP 00: Smart Kernel Reboot Check ===
+if [ ! -f "$MARKER_DIR/00_kernel_check.done" ]; then
+  CURRENT_KERNEL=$(uname -r)
+  LATEST_KERNEL=$(dpkg -l | awk '/linux-image-[0-9]+/{print $2}' | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+' | sort -V | tail -n1 || true)
+
+  if [[ -n "$LATEST_KERNEL" && "$CURRENT_KERNEL" != "$LATEST_KERNEL" ]]; then
+    echo -e "\e[91m[STEP 00] A newer kernel ($LATEST_KERNEL) is installed but not active.\e[0m"
+    echo -e "\e[91mSystem will reboot in 10 seconds to apply the kernel update.\e[0m"
+    echo -e "\e[91mAfter reboot you must rerun this installer script to continue the setup.\e[0m"
+    sleep 10
+    touch "$MARKER_DIR/00_kernel_check.done"
+    reboot
+    exit 0
+  else
+    echo -e "\e[91m[STEP 00] Kernel already up to date.\e[0m"
+    touch "$MARKER_DIR/00_kernel_check.done"
+  fi
+fi
+
 # === STEP 01: Wait for DNS and GitHub ===
 if [ ! -f "$MARKER_DIR/01_dns_check.done" ]; then
   echo -e "\e[91m[STEP 01] Checking GitHub DNS...\e[0m"
@@ -40,7 +59,7 @@ if [ ! -f "$MARKER_DIR/03_install_bun.done" ]; then
   export PATH="$BUN_INSTALL/bin:$PATH"
   echo 'export BUN_INSTALL="$HOME/.bun"' >> ~/.bashrc
   echo 'export PATH="$BUN_INSTALL/bin:$PATH"' >> ~/.bashrc
-  source ~/.bashrc
+  # Do not source ~/.bashrc here to avoid PS1 warnings in non-interactive shells
   touch "$MARKER_DIR/03_install_bun.done"
 else
   echo -e "\e[91m[STEP 03] Already completed.\e[0m"
@@ -56,7 +75,13 @@ if [ ! -f "$MARKER_DIR/04_clone_repo.done" ]; then
     git clone https://github.com/kynesyslabs/node.git /opt/demos-node
   fi
   cd /opt/demos-node
-  bun install
+  # Use installed bun binary without relying on sourcing .bashrc
+  if [ -x "$HOME/.bun/bin/bun" ]; then
+    "$HOME/.bun/bin/bun" install
+  else
+    echo -e "\e[91mBun not found in $HOME/.bun/bin; attempting to run 'bun' from PATH.\e[0m"
+    bun install
+  fi
   touch "$MARKER_DIR/04_clone_repo.done"
 else
   echo -e "\e[91m[STEP 04] Already completed.\e[0m"
@@ -98,19 +123,4 @@ else
   echo -e "\e[91m[STEP 06] Already completed.\e[0m"
 fi
 
-# === STEP 07: Reboot Once ===
-if [ ! -f "$MARKER_DIR/07_reboot_once.done" ]; then
-  echo -e "\e[91m[STEP 07] WARNING: System will reboot in 10 seconds to apply kernel updates and finalize setup.\e[0m"
-  echo -e "\e[91mAfter reboot, the Demos Node will start automatically as a systemd service.\e[0m"
-  echo -e "\e[91mTo check node status, use:\e[0m check_demos_node --status"
-  echo -e "\e[91mTo view logs, use:\e[0m check_demos_node --logs=50"
-  echo -e "\e[91mTo run a full health check, use:\e[0m check_demos_node --health"
-  echo -e "\e[91mTo auto-restart if unhealthy, use:\e[0m check_demos_node --autorestart"
-  sleep 10
-  touch "$MARKER_DIR/07_reboot_once.done"
-  reboot
-else
-  echo -e "\e[91m[STEP 07] Reboot already completed.\e[0m"
-fi
-
-echo -e "\e[92m✅ Demos Node installation complete.\e[0m"
+echo -e "\e[91m✅ Demos Node installation complete.\e[0m"
