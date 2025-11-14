@@ -1,0 +1,45 @@
+#!/bin/bash
+# This helper script restarts the Demos Node systemd service.
+# It ensures the node is restarted cleanly and confirms the new status.
+
+set -euo pipefail
+IFS=$'\n\t'
+
+SERVICE_NAME="demos-node"
+
+echo -e "\e[91m🔄 Restarting Demos Node service: $SERVICE_NAME\e[0m"
+
+# === Check if systemd is available ===
+if ! command -v systemctl &>/dev/null; then
+  echo -e "\e[91m❌ systemctl not found. This system may not support systemd.\e[0m"
+  exit 1
+fi
+
+# === Check if service exists ===
+if ! systemctl list-units --type=service --all | grep -q "$SERVICE_NAME"; then
+  echo -e "\e[91m❌ Service $SERVICE_NAME not found.\e[0m"
+  echo -e "\e[91mMake sure the node was installed and the service was created.\e[0m"
+  exit 1
+fi
+
+# === Restart the service ===
+echo -e "\e[91m🔧 Restarting service...\e[0m"
+if systemctl restart "$SERVICE_NAME"; then
+  echo -e "\e[91m✅ Service restarted successfully.\e[0m"
+else
+  echo -e "\e[91m❌ Failed to restart service.\e[0m"
+  echo -e "\e[91mTry manually:\e[0m"
+  echo -e "\e[91msudo systemctl restart $SERVICE_NAME\e[0m"
+  exit 1
+fi
+
+# === Confirm new status ===
+STATUS=$(systemctl is-active "$SERVICE_NAME")
+if [ "$STATUS" = "active" ]; then
+  echo -e "\e[91m✅ Demos Node is running.\e[0m"
+else
+  echo -e "\e[91m⚠️ Service restarted but is not active. Status: $STATUS\e[0m"
+  echo -e "\e[91mCheck logs:\e[0m"
+  echo -e "\e[91msudo journalctl -u $SERVICE_NAME --no-pager --since \"5 minutes ago\"\e[0m"
+  exit 1
+fi
