@@ -1,17 +1,24 @@
 #!/bin/bash
-# This helper script checks the status of the Demos Node systemd service.
-# It provides a clear summary of whether the node is running, inactive, or failed.
+# This helper script performs a detailed health check on the Demos Node systemd service.
+# It explains the current status, PID, and optionally checks the HTTP endpoint.
 
 set -euo pipefail
 IFS=$'\n\t'
 
 SERVICE_NAME="demos-node"
+HTTP_ENDPOINT="http://localhost:8080/health"  # Optional: adjust if your node exposes a health route
 
-echo -e "\e[91m🔍 Checking status of Demos Node service: $SERVICE_NAME\e[0m"
+echo -e "\e[91m🔍 Starting full health check for Demos Node service: $SERVICE_NAME\e[0m"
 
-# === Check if systemd is available ===
+# === Check for systemd ===
 if ! command -v systemctl &>/dev/null; then
   echo -e "\e[91m❌ systemctl not found. This system may not support systemd.\e[0m"
+  exit 1
+fi
+
+# === Check for journalctl ===
+if ! command -v journalctl &>/dev/null; then
+  echo -e "\e[91m❌ journalctl not found. Cannot display logs.\e[0m"
   exit 1
 fi
 
@@ -22,18 +29,52 @@ if ! systemctl list-units --type=service --all | grep -q "$SERVICE_NAME"; then
   exit 1
 fi
 
-# === Get service status ===
+# === Get systemd status and PID ===
 STATUS=$(systemctl is-active "$SERVICE_NAME")
-if [ "$STATUS" = "active" ]; then
-  echo -e "\e[91m✅ Demos Node is running.\e[0m"
-elif [ "$STATUS" = "inactive" ]; then
-  echo -e "\e[91m⚠️ Demos Node is installed but not running.\e[0m"
-  echo -e "\e[91mYou can start it with:\e[0m"
-  echo -e "\e[91msudo systemctl start $SERVICE_NAME\e[0m"
-elif [ "$STATUS" = "failed" ]; then
-  echo -e "\e[91m❌ Demos Node service has failed.\e[0m"
-  echo -e "\e[91mCheck logs:\e[0m"
-  echo -e "\e[91msudo journalctl -u $SERVICE_NAME --no-pager --since \"10 minutes ago\"\e[0m"
+PID=$(systemctl show -p MainPID "$SERVICE_NAME" | cut -d= -f2)
+
+echo -e "\e[91m🧠 Systemd Status: $STATUS\e[0m"
+case "$STATUS" in
+  active)
+    echo -e "\e[91m✅ The service is running normally.\e[0m"
+    ;;
+  inactive)
+    echo -e "\e[91m⚠️ The service is installed but not running.\e[0m"
+    echo -e "\e[91mYou can start it with:\e[0m"
+    echo -e "\e[91msudo systemctl start $SERVICE_NAME\e[0m"
+    ;;
+  failed)
+    echo -e "\e[91m❌ The service has crashed or failed to start.\e[0m"
+    echo -e "\e[91mRecent logs:\e[0m"
+    journalctl -u "$SERVICE_NAME" --no-pager -n 20
+    echo -e "\e[91mYou can try restarting it:\e[0m"
+    echo -e "\e[91msudo systemctl restart $SERVICE_NAME\e[0m"
+    ;;
+  activating)
+    echo -e "\e[91m⏳ The service is in the process of starting.\e[0m"
+    ;;
+  deactivating)
+    echo -e "\e[91m⏸️ The service is shutting down.\e[0m"
+    ;;
+  *)
+    echo -e "\e[91m❓ Unknown status: $STATUS\e[0m"
+    ;;
+esac
+
+# === PID check ===
+if [ "$PID" -gt 0 ]; then
+  echo -e "\e[91m🧬 Main PID: $PID\e[0m"
+  echo -e "\e[91m✅ The process is alive and tracked by systemd.\e[0m"
 else
-  echo -e "\e[91m❓ Unknown service status: $STATUS\e[0m"
+  echo -e "\e[91m⚠️ No active process found. The service may be stopped or failed.\e[0m"
+fi
+
+# === Optional HTTP health check ===
+echo -e "\e[91m🌐 Checking HTTP endpoint: $HTTP_ENDPOINT\e[0m"
+if curl -fs "$HTTP_ENDPOINT" &>/dev/null; then
+  echo -e "\e[91m✅ HTTP endpoint is responsive.\e[0m"
+else
+  echo -e "\e[91m⚠️ HTTP endpoint is not responding.\e[0m"
+  echo -e "\e[91mThis may indicate the node is running but not serving traffic.\e[0m"
+  echo -e "\e[91mCheck if the port is correct or if the node exposes a health route.\e[0m"
 fi
