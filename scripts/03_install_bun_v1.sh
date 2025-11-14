@@ -63,12 +63,24 @@ systemctl daemon-reexec
 
 # === Verify Bun ===
 echo -e "\e[91m🔍 Verifying Bun installation...\e[0m"
-if command -v bun &>/dev/null; then
-  echo -e "\e[91m✅ Bun is installed and available in PATH.\e[0m"
-  touch "$STEP_MARKER"
-else
+if ! command -v bun &>/dev/null; then
   echo -e "\e[91m❌ Bun is not available in PATH after installation.\e[0m"
   echo -e "\e[91mTry running:\e[0m"
   echo -e "\e[91mexport PATH=\"${HOME:-/root}/.bun/bin:\$PATH\"\e[0m"
   exit 1
 fi
+
+# === Check Bun version ===
+BUN_VERSION=$(bun --version || echo "unknown")
+echo -e "\e[91m✅ Bun version: $BUN_VERSION\e[0m"
+
+# === Run a test script ===
+echo 'console.log("✅ Bun test script executed successfully!")' > /tmp/bun_test.ts
+if ! bun /tmp/bun_test.ts &>/dev/null; then
+  echo -e "\e[91m❌ Bun failed to execute a test script.\e[0m"
+  echo -e "\e[91mTry reinstalling or checking your shell environment.\e[0m"
+  exit 1
+fi
+
+echo -e "\e[91m✅ Bun is fully installed and operational.\e[0m"
+touch "$STEP_MARKER"
