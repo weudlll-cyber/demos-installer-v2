@@ -48,7 +48,7 @@ fi
 # === Configure .env ===
 if [ ! -f .env ]; then
   echo -e "\e[91m🔧 Generating .env configuration...\e[0m"
-  cp env.example .env
+  cp /opt/demos-node/env.example .env
 
   PUBLIC_IP=$(curl -s ifconfig.me || echo "localhost")
   DEFAULT_URL="http://$PUBLIC_IP:$CUSTOM_NODE_PORT"
