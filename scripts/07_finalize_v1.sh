@@ -73,7 +73,13 @@ fi
 # === Configure demos_peerlist.json ===
 if [ ! -f demos_peerlist.json ]; then
   echo -e "\e[91m🔧 Creating default demos_peerlist.json...\e[0m"
-  cp demos_peerlist.json.example demos_peerlist.json
+  if [ -f /opt/demos-node/demos_peerlist.json.example ]; then
+    cp /opt/demos-node/demos_peerlist.json.example demos_peerlist.json
+    echo -e "\e[91m✅ Loaded template from /opt/demos-node/demos_peerlist.json.example\e[0m"
+  else
+    echo -e "\e[91m⚠️ demos_peerlist.json.example not found. Creating an empty peer list...\e[0m"
+    echo "{}" > demos_peerlist.json
+  fi
 else
   echo -e "\e[91m✅ demos_peerlist.json already exists. Skipping...\e[0m"
 fi
