@@ -6,6 +6,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 SERVICE_NAME="demos-node"
+UNIT_NAME="${SERVICE_NAME}.service"
 HTTP_ENDPOINT="http://localhost:8080/health"  # Optional: adjust if your node exposes a health route
 
 echo -e "\e[91m🔍 Starting full health check for Demos Node service: $SERVICE_NAME\e[0m"
@@ -23,17 +24,17 @@ if ! command -v journalctl &>/dev/null; then
 fi
 
 # === Check if service exists ===
-if ! systemctl show "$SERVICE_NAME" &>/dev/null; then
-  echo -e "\e[91m❌ Service $SERVICE_NAME not found.\e[0m"
+if ! systemctl status "$UNIT_NAME" &>/dev/null; then
+  echo -e "\e[91m❌ Service $UNIT_NAME not found.\e[0m"
   echo -e "\e[91mMake sure the node was installed and the service was created.\e[0m"
   echo -e "\e[91mTry:\e[0m"
-  echo -e "\e[91msudo systemctl daemon-reload && sudo systemctl enable $SERVICE_NAME && sudo systemctl start $SERVICE_NAME\e[0m"
+  echo -e "\e[91msudo systemctl daemon-reload && sudo systemctl enable $UNIT_NAME && sudo systemctl start $UNIT_NAME\e[0m"
   exit 1
 fi
 
 # === Get systemd status and PID ===
-STATUS=$(systemctl is-active "$SERVICE_NAME")
-PID=$(systemctl show -p MainPID "$SERVICE_NAME" | cut -d= -f2 || echo 0)
+STATUS=$(systemctl is-active "$UNIT_NAME")
+PID=$(systemctl show -p MainPID "$UNIT_NAME" | cut -d= -f2 || echo 0)
 PID=${PID:-0}
 
 echo -e "\e[91m🧠 Systemd Status: $STATUS\e[0m"
@@ -44,14 +45,14 @@ case "$STATUS" in
   inactive)
     echo -e "\e[91m⚠️ The service is installed but not running.\e[0m"
     echo -e "\e[91mYou can start it with:\e[0m"
-    echo -e "\e[91msudo systemctl start $SERVICE_NAME\e[0m"
+    echo -e "\e[91msudo systemctl start $UNIT_NAME\e[0m"
     ;;
   failed)
     echo -e "\e[91m❌ The service has crashed or failed to start.\e[0m"
     echo -e "\e[91mRecent logs:\e[0m"
-    journalctl -u "$SERVICE_NAME" --no-pager -n 20
+    journalctl -u "$UNIT_NAME" --no-pager -n 20
     echo -e "\e[91mYou can try restarting it:\e[0m"
-    echo -e "\e[91msudo systemctl restart $SERVICE_NAME\e[0m"
+    echo -e "\e[91msudo systemctl restart $UNIT_NAME\e[0m"
     ;;
   activating)
     echo -e "\e[91m⏳ The service is in the process of starting.\e[0m"
