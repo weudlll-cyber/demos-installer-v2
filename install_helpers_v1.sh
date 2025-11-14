@@ -1,149 +1,109 @@
 #!/bin/bash
-set -euo pipefail
+set -e
 IFS=$'\n\t'
 
-echo -e "\e[91mStarting Demos Node Installer...\e[0m"
-
-MARKER_DIR="/root/.demos_node_setup"
-mkdir -p "$MARKER_DIR"
-
-# === STEP 00: Smart Kernel Reboot Check ===
-if [ ! -f "$MARKER_DIR/00_kernel_check.done" ]; then
-  CURRENT_KERNEL=$(uname -r)
-  LATEST_KERNEL=$(dpkg -l | awk '/linux-image-[0-9]+/{print $2}' | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+' | sort -V | tail -n1 || true)
-
-  if [[ -n "$LATEST_KERNEL" && "$CURRENT_KERNEL" != "$LATEST_KERNEL" ]]; then
-    echo -e "\e[91m[STEP 00] A newer kernel ($LATEST_KERNEL) is installed but not active.\e[0m"
-    echo -e "\e[91mSystem will reboot in 10 seconds to apply the kernel update.\e[0m"
-    echo -e "\e[91mAfter reboot you must rerun this installer script to continue the setup.\e[0m"
-    sleep 10
-    touch "$MARKER_DIR/00_kernel_check.done"
-    reboot
-    exit 0
-  else
-    echo -e "\e[91m[STEP 00] Kernel already up to date.\e[0m"
-    touch "$MARKER_DIR/00_kernel_check.done"
-  fi
+# Ensure we're using Bash
+if [ -z "$BASH_VERSION" ]; then
+  echo "❌ This script must be run with bash. Try: bash install_helpers_v1.sh"
+  exit 1
 fi
 
-# === STEP 01: Wait for DNS and GitHub ===
-if [ ! -f "$MARKER_DIR/01_dns_check.done" ]; then
-  echo -e "\e[91m[STEP 01] Checking GitHub DNS...\e[0m"
-  until ping -c1 github.com &>/dev/null; do
-    echo -e "\e[91mWaiting for GitHub DNS resolution...\e[0m"
-    sleep 5
-  done
-  touch "$MARKER_DIR/01_dns_check.done"
-  echo -e "\e[91m✅ GitHub DNS resolved.\e[0m"
-else
-  echo -e "\e[91m[STEP 01] Already completed.\e[0m"
-fi
+HELPER_DIR="/root/demos_helpers"
+GLOBAL_BIN="/usr/local/bin"
+MONITOR_LOG="/var/log/demos_node_monitor.log"
 
-# === STEP 02: Install Docker ===
-if [ ! -f "$MARKER_DIR/02_install_docker.done" ]; then
-  echo -e "\e[91m[STEP 02] Installing Docker...\e[0m"
-  apt-get update && apt-get install -y docker.io
-  systemctl enable docker && systemctl start docker
-  if command -v docker >/dev/null 2>&1; then
-    touch "$MARKER_DIR/02_install_docker.done"
-    echo -e "\e[91m✅ Docker installed successfully.\e[0m"
-  else
-    echo -e "\e[91m❌ Docker installation failed.\e[0m"
-    exit 1
-  fi
-else
-  echo -e "\e[91m[STEP 02] Already completed.\e[0m"
-fi
+mkdir -p "$HELPER_DIR" "$GLOBAL_BIN" || true
 
-# === STEP 03: Install Bun ===
-if [ ! -f "$MARKER_DIR/03_install_bun.done" ]; then
-  echo -e "\e[91m[STEP 03] Installing Bun...\e[0m"
-  apt-get install -y unzip
-  curl -fsSL https://bun.sh/install | bash
-  export BUN_INSTALL="$HOME/.bun"
-  export PATH="$BUN_INSTALL/bin:$PATH"
-  echo 'export BUN_INSTALL="$HOME/.bun"' >> ~/.bashrc
-  echo 'export PATH="$BUN_INSTALL/bin:$PATH"' >> ~/.bashrc
-  if [ -x "$HOME/.bun/bin/bun" ]; then
-    touch "$MARKER_DIR/03_install_bun.done"
-    echo -e "\e[91m✅ Bun installed successfully.\e[0m"
-  else
-    echo -e "\e[91m❌ Bun installation failed.\e[0m"
-    exit 1
-  fi
-else
-  echo -e "\e[91m[STEP 03] Already completed.\e[0m"
-fi
-
-# === STEP 04: Clone Testnet Node Repo ===
-if [ ! -f "$MARKER_DIR/04_clone_repo.done" ]; then
-  echo -e "\e[91m[STEP 04] Cloning Testnet Node repository...\e[0m"
-  if [ -d "/opt/demos-node/.git" ]; then
-    echo -e "\e[91m[STEP 04] Repo already exists at /opt/demos-node. Skipping clone.\e[0m"
-  else
-    rm -rf /opt/demos-node 2>/dev/null || true
-    git clone https://github.com/kynesyslabs/node.git /opt/demos-node
-  fi
-  cd /opt/demos-node
-  bun install
-  if [ -f "run" ]; then
-    touch "$MARKER_DIR/04_clone_repo.done"
-    echo -e "\e[91m✅ Repository cloned and dependencies installed.\e[0m"
-  else
-    echo -e "\e[91m❌ Node repo setup failed.\e[0m"
-    exit 1
-  fi
-else
-  echo -e "\e[91m[STEP 04] Already completed.\e[0m"
-fi
-
-# === STEP 05: Create Systemd Service ===
-if [ ! -f "$MARKER_DIR/05_systemd_service.done" ]; then
-  echo -e "\e[91m[STEP 05] Creating systemd service...\e[0m"
-  cat > /etc/systemd/system/demos-node.service <<EOF
-[Unit]
-Description=Demos Node Service
-After=network.target
-
-[Service]
-ExecStart=/opt/demos-node/run
-Restart=always
-User=root
-Environment=NODE_ENV=production
-WorkingDirectory=/opt/demos-node
-Environment=PATH=/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
-[Install]
-WantedBy=multi-user.target
+# restart helper
+cat > "$HELPER_DIR/restart_demos_node.sh" <<'EOF'
+#!/bin/bash
+set -e
+systemctl restart demos-node.service
+systemctl status demos-node.service --no-pager -l
 EOF
-  systemctl daemon-reexec
-  systemctl daemon-reload
-  systemctl enable demos-node.service
-  systemctl start demos-node.service
-  sleep 2
-  if systemctl is-active --quiet demos-node.service; then
-    touch "$MARKER_DIR/05_systemd_service.done"
-    echo -e "\e[91m✅ Demos Node service is running.\e[0m"
-  else
-    echo -e "\e[91m❌ Demos Node service failed to start.\e[0m"
-    exit 1
-  fi
-else
-  echo -e "\e[91m[STEP 05] Already completed.\e[0m"
-fi
+chmod 755 "$HELPER_DIR/restart_demos_node.sh"
 
-# === STEP 06: Install Helper Scripts ===
-if [ ! -f "$MARKER_DIR/06_install_helpers.done" ]; then
-  echo -e "\e[91m[STEP 06] Installing helper scripts...\e[0m"
-  if curl -fsSL https://raw.githubusercontent.com/weudl-cyber/demos-installer-v2/main/install_helpers_v1.sh | bash; then
-    touch "$MARKER_DIR/06_install_helpers.done"
-    echo -e "\e[91m✅ Helper scripts installed.\e[0m"
-  else
-    echo -e "\e[91m❌ Failed to install helper scripts.\e[0m"
-    exit 1
-  fi
-else
-  echo -e "\e[91m[STEP 06] Already completed.\e[0m"
-fi
+# backup keys
+cat > "$HELPER_DIR/backup_demos_keys.sh" <<'EOF'
+#!/bin/bash
+set -e
+mkdir -p ~/demos-keys
+cp /root/node/publickey ~/demos-keys/publickey 2>/dev/null || true
+cp /root/node/privatekey ~/demos-keys/privatekey 2>/dev/null || true
+chmod 600 ~/demos-keys/privatekey 2>/dev/null || true
+ls -l ~/demos-keys || true
+EOF
+chmod 700 "$HELPER_DIR/backup_demos_keys.sh"
 
-echo -e "\e[91m✅ Demos Node installation complete.\e[0m"
+# stop helper
+cat > "$HELPER_DIR/stop_demos_node.sh" <<'EOF'
+#!/bin/bash
+set -e
+systemctl stop demos-node.service || true
+systemctl disable --now demos-node.service || true
+pgrep -f "/root/node" | xargs -r sudo kill -9 || true
+pkill -f "/root/node/run" || true
+lsof -ti :5332 | xargs -r sudo kill -9 || true
+lsof -ti :53550 | xargs -r sudo kill -9 || true
+docker ps -q --filter "name=demos" | xargs -r docker stop || true
+rm -f /run/demos-node.pid /var/run/demos-node.pid /root/.demos_node_setup/installer.lock || true
+systemctl status demos-node.service --no-pager -l || true
+echo "Stop sequence complete"
+EOF
+chmod 755 "$HELPER_DIR/stop_demos_node.sh"
+
+# health-check script
+cat > "$HELPER_DIR/check_demos_node.sh" <<'EOF'
+#!/bin/bash
+set -e
+NODE_DIR="/root/node"
+SERVICE="demos-node.service"
+MON_LOG="/var/log/demos_node_monitor.log"
+HEALTH_URL="http://127.0.0.1:53550/health"
+AUTORESTART=0
+
+usage(){ echo "Usage: $0 [--status] [--logs=N] [--health] [--autorestart] [--restart]"; exit 1; }
+
+TAIL_LINES=50
+for arg in "$@"; do
+  case "$arg" in
+    --status) ACTION_STATUS=1 ;;
+    --logs=*) ACTION_LOGS=1; TAIL_LINES="${arg#*=}" ;;
+    --health) ACTION_HEALTH=1 ;;
+    --autorestart) AUTORESTART=1 ;;
+    --restart) ACTION_RESTART=1 ;;
+    --help) usage ;;
+    *) ;;
+  esac
+done
+
+log(){ echo "[$(date '+%F %T')] $*" | tee -a "$MON_LOG"; }
+
+if [ "${ACTION_STATUS:-0}" = "1" ]; then systemctl status "$SERVICE" --no-pager -l; fi
+if [ "${ACTION_LOGS:-0}" = "1" ]; then journalctl -u "$SERVICE" -n "$TAIL_LINES" --no-pager; fi
+if [ "${ACTION_RESTART:-0}" = "1" ]; then log "Manual restart requested"; systemctl restart "$SERVICE"; sleep 2; systemctl is-active --quiet "$SERVICE" && log "Service active after restart" || log "Service not active after restart"; exit 0; fi
+
+HEALTH_OK=0
+if systemctl is-active --quiet "$SERVICE"; then log "systemd reports $SERVICE running"; HEALTH_OK=1; else log "systemd reports $SERVICE NOT running"; HEALTH_OK=0; fi
+if pgrep -f "/root/node" >/dev/null 2>&1; then log "Process referencing /root/node exists"; HEALTH_OK=$((HEALTH_OK+1)); else log "No process referencing /root/node"; fi
+if command -v curl >/dev/null 2>&1; then
+  if curl -sSf --max-time 3 "$HEALTH_URL" >/dev/null 2>&1; then log "HTTP health endpoint OK: $HEALTH_URL"; HEALTH_OK=$((HEALTH_OK+1)); else log "HTTP health endpoint failed or not present: $HEALTH_URL"; fi
+else log "curl not present, skipped HTTP health check"; fi
+
+if [ "$HEALTH_OK" -ge 2 ]; then log "Node appears HEALTHY (score=$HEALTH_OK)"; exit 0; else log "Node UNHEALTHY (score=$HEALTH_OK)"; if [ "$AUTORESTART" -eq 1 ]; then log "Auto-restart enabled"; systemctl restart "$SERVICE"; sleep 3; systemctl is-active --quiet "$SERVICE" && log "Service active after auto-restart" && exit 0 || log "Still not active" && exit 2; fi; exit 2; fi
+EOF
+chmod 755 "$HELPER_DIR/check_demos_node.sh"
+
+# Symlink helpers to /usr/local/bin
+ln -sf "$HELPER_DIR/restart_demos_node.sh" "$GLOBAL_BIN/restart_demos_node"
+ln -sf "$HELPER_DIR/backup_demos_keys.sh" "$GLOBAL_BIN/backup_demos_keys"
+ln -sf "$HELPER_DIR/stop_demos_node.sh" "$GLOBAL_BIN/stop_demos_node"
+ln -sf "$HELPER_DIR/check_demos_node.sh" "$GLOBAL_BIN/check_demos_node"
+chmod 755 "$GLOBAL_BIN/restart_demos_node" "$GLOBAL_BIN/backup_demos_keys" "$GLOBAL_BIN/stop_demos_node" "$GLOBAL_BIN/check_demos_node" || true
+
+# Ensure monitor log exists
+touch "$MONITOR_LOG" || true
+chown root:root "$MONITOR_LOG" || true
+chmod 644 "$MONITOR_LOG" || true
+
+echo "✅ Helpers installed to $HELPER_DIR and symlinked to $GLOBAL_BIN"
