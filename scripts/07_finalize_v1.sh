@@ -81,7 +81,7 @@ INTERVAL=10
 WAITED=0
 
 while [ "$WAITED" -lt "$MAX_WAIT" ]; do
-  if [ -f /opt/demos-node/.demos_identity ] && ls /opt/demos-node/.publickey_* &>/dev/null; then
+  if [ -f /opt/demos-node/.demos_identity ] && ls /opt/demos-node/publickey_ed25519_* &>/dev/null; then
     echo -e "\e[91m✅ Identity keys detected.\e[0m"
     break
   fi
@@ -103,12 +103,10 @@ echo -e "\e[91m🔗 Configuring demos_peerlist.json with this node's public key.
 
 cd /opt/demos-node
 PEERLIST_PATH="/opt/demos-node/demos_peerlist.json"
-PUBKEY_FILE=$(ls -a .publickey_* 2>/dev/null | head -n 1)
+PUBKEY_FILE=$(ls publickey_ed25519_* 2>/dev/null | head -n 1)
 
-if [ -z "$PUBKEY_FILE" ]; then
-  echo -e "\e[91m⚠️ No public key found. Skipping peer list configuration.\e[0m"
-else
-  PUBKEY_HEX=$(echo "$PUBKEY_FILE" | sed 's/\.publickey_//')
+if [ -n "$PUBKEY_FILE" ]; then
+  PUBKEY_HEX=$(echo "$PUBKEY_FILE" | sed 's/publickey_ed25519_//')
   NODE_IP=$(hostname -I | awk '{print $1}')
   NODE_URL="http://$NODE_IP:$CUSTOM_NODE_PORT"
 
@@ -117,6 +115,8 @@ else
 
   echo -e "\e[91m🔄 Restarting node to apply peer list changes...\e[0m"
   systemctl restart demos-node
+else
+  echo -e "\e[91m⚠️ No public key found. Skipping peer list configuration.\e[0m"
 fi
 
 # === Backup identity keys ===
@@ -125,7 +125,7 @@ BACKUP_DIR="/root/demos_node_backups/backup_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$BACKUP_DIR"
 
 cp /opt/demos-node/.demos_identity "$BACKUP_DIR/" 2>/dev/null || echo -e "\e[91m⚠️ No .demos_identity file found.\e[0m"
-cp /opt/demos-node/.publickey_* "$BACKUP_DIR/" 2>/dev/null || echo -e "\e[91m⚠️ No publickey file found.\e[0m"
+cp /opt/demos-node/publickey_ed25519_* "$BACKUP_DIR/" 2>/dev/null || echo -e "\e[91m⚠️ No publickey file found.\e[0m"
 
 echo -e "\e[91m✅ Keys backed up to: $BACKUP_DIR\e[0m"
 
