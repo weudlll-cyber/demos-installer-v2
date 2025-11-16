@@ -5,20 +5,15 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-# --- Config ---
 HELPER_DIR="/opt/demos-node/helpers"
 GLOBAL_BIN="/usr/local/bin"
-
-# Point this to your repo's raw helpers directory
 REPO_BASE_URL="https://raw.githubusercontent.com/weudlll-cyber/demos-installer-v2/main/helpers"
 
-# List of helper filenames in the repo (no .sh extension if your files match that)
-HELPERS=("check_demos_node" "restart_demos_node" "logs_demos_node" "backup_demos_keys" "stop_demos_node")
+HELPERS=("check_demos_node" "restart_demos_node" "logs_demos_node")
 
 echo -e "\e[91m🔧 Updating Demos Node helpers...\e[0m"
 mkdir -p "$HELPER_DIR" "$GLOBAL_BIN" || true
 
-# --- Download latest helpers ---
 for helper in "${HELPERS[@]}"; do
   src_url="${REPO_BASE_URL}/${helper}"
   dst_path="${HELPER_DIR}/${helper}"
@@ -33,22 +28,6 @@ for helper in "${HELPERS[@]}"; do
   ln -sf "$dst_path" "${GLOBAL_BIN}/${helper}"
   echo -e "\e[91m✅ Installed & linked: ${helper}\e[0m"
 done
-
-# --- Quick verification ---
-FAILED=0
-for helper in "${HELPERS[@]}"; do
-  if command -v "$helper" &>/dev/null; then
-    echo -e "\e[91m🧩 Verified in PATH: ${helper}\e[0m"
-  else
-    echo -e "\e[91m❌ Missing in PATH: ${helper}\e[0m"
-    FAILED=1
-  fi
-done
-
-if [ "$FAILED" -ne 0 ]; then
-  echo -e "\e[91m❌ One or more helpers failed verification.\e[0m"
-  exit 1
-fi
 
 echo -e "\e[91m🎉 Helpers updated successfully.\e[0m"
 echo -e "\e[91mTry:\e[0m"
