@@ -95,12 +95,35 @@ if ! command -v curl &>/dev/null; then
 fi
 echo -e "\e[91m✅ curl is installed.\e[0m"
 
-# === Repair dpkg if interrupted ===
+# === Repair dpkg if interrupted (with lock wait) ===
 # dpkg --audit checks for broken package states
 # dpkg --configure -a attempts to fix them
 echo -e "\e[91m🔍 Checking for broken package installations...\e[0m"
 if dpkg --audit | grep -q .; then
   echo -e "\e[91m⚠️ dpkg was interrupted. Attempting repair...\e[0m"
+  echo -e "\e[91mℹ️ This often happens if the VPS is still finishing its initial setup or auto-updates.\e[0m"
+  echo -e "\e[91m⏳ Waiting up to 2 minutes for dpkg lock to clear, checking every 10 seconds...\e[0m"
+
+  LOCK_FILE="/var/lib/dpkg/lock-frontend"
+  WAIT_TIME=120
+  INTERVAL=10
+  WAITED=0
+
+  while sudo fuser "$LOCK_FILE" >/dev/null 2>&1 && [ "$WAITED" -lt "$WAIT_TIME" ]; do
+    echo -e "\e[91m⌛ dpkg is locked... ($WAITED/$WAIT_TIME seconds)\e[0m"
+    sleep "$INTERVAL"
+    WAITED=$((WAITED + INTERVAL))
+  done
+
+  if sudo fuser "$LOCK_FILE" >/dev/null 2>&1; then
+    echo -e "\e[91m❌ dpkg is still locked after waiting.\e[0m"
+    echo -e "\e[91m👉 This usually means the VPS is still setting up. Wait a minute, then run:\e[0m"
+    echo -e "\e[91msudo dpkg --configure -a\e[0m"
+    echo -e "\e[91mThen restart the installer:\e[0m"
+    echo -e "\e[91msudo bash demos_node_setup_v1.sh\e[0m"
+    exit 1
+  fi
+
   dpkg --configure -a || {
     echo -e "\e[91m❌ dpkg repair failed.\e[0m"
     echo -e "\e[91mRun manually:\e[0m"
