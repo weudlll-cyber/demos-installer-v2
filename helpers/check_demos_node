@@ -2,45 +2,59 @@
 # This helper script performs a detailed health check on the Demos Node systemd service.
 # It explains the current status, PID, and checks the HTTP endpoint using .env configuration.
 
-set -u
+set -euo pipefail
 IFS=$'\n\t'
 
 SERVICE_NAME="demos-node"
 UNIT_NAME="${SERVICE_NAME}.service"
 
-# === Load .env variables ===
+# === Load .env variables and build HTTP endpoint ===
 ENV_FILE="/opt/demos-node/.env"
+NODE_PORT="53550"
+BASE_URL="http://127.0.0.1:$NODE_PORT"
+
 if [ -f "$ENV_FILE" ]; then
-  NODE_PORT=$(grep "^NODE_PORT=" "$ENV_FILE" | cut -d'=' -f2)
-  EXPOSED_URL=$(grep "^EXPOSED_URL=" "$ENV_FILE" | cut -d'=' -f2)
-  # Fallback if EXPOSED_URL is missing
-  if [ -z "$EXPOSED_URL" ]; then
-    PUBLIC_IP=$(curl -s ifconfig.me || echo "localhost")
-    EXPOSED_URL="http://$PUBLIC_IP:$NODE_PORT"
+  NODE_PORT=$(grep -m1 "^NODE_PORT=" "$ENV_FILE" | cut -d'=' -f2 || echo "53550")
+  EXPOSED_URL=$(grep -m1 "^EXPOSED_URL=" "$ENV_FILE" | cut -d'=' -f2 || true)
+  EXPOSED_IP=$(grep -m1 "^EXPOSED_IP=" "$ENV_FILE" | cut -d'=' -f2 || true)
+
+  if [ -n "$EXPOSED_URL" ]; then
+    # Use provided URL. Ensure scheme present and port appended if missing.
+    BASE_URL="$EXPOSED_URL"
+    if [[ "$BASE_URL" != http://* && "$BASE_URL" != https://* ]]; then
+      BASE_URL="http://$BASE_URL"
+    fi
+    # append port if absent
+    if [[ "$BASE_URL" != *":$NODE_PORT" ]]; then
+      BASE_URL="${BASE_URL%/}:$NODE_PORT"
+    fi
+  elif [ -n "$EXPOSED_IP" ]; then
+    # IP-only: handle IPv6 bracket notation
+    if [[ "$EXPOSED_IP" == *:* ]]; then
+      BASE_URL="http://[$EXPOSED_IP]:$NODE_PORT"
+    else
+      BASE_URL="http://$EXPOSED_IP:$NODE_PORT"
+    fi
+  else
+    BASE_URL="http://127.0.0.1:$NODE_PORT"
   fi
-else
-  NODE_PORT=53550
-  PUBLIC_IP=$(curl -s ifconfig.me || echo "localhost")
-  EXPOSED_URL="http://$PUBLIC_IP:$NODE_PORT"
 fi
 
-HTTP_ENDPOINT="${EXPOSED_URL}/health"
+HTTP_ENDPOINT="${BASE_URL%/}/health"
 
 echo -e "\e[91m🔍 Starting full health check for Demos Node service: $SERVICE_NAME\e[0m"
 
-# === Check for systemd ===
+# === Pre-checks: systemctl, journalctl, service existence ===
 if ! command -v systemctl &>/dev/null; then
   echo -e "\e[91m❌ systemctl not found. This system may not support systemd.\e[0m"
   exit 1
 fi
 
-# === Check for journalctl ===
 if ! command -v journalctl &>/dev/null; then
   echo -e "\e[91m❌ journalctl not found. Cannot display logs.\e[0m"
   exit 1
 fi
 
-# === Check if service exists ===
 if ! systemctl show "$UNIT_NAME" &>/dev/null; then
   echo -e "\e[91m❌ Service $UNIT_NAME not found.\e[0m"
   echo -e "\e[91mMake sure the node was installed and the service was created.\e[0m"
@@ -92,10 +106,12 @@ fi
 
 # === HTTP health check ===
 echo -e "\e[91m🌐 Checking HTTP endpoint: $HTTP_ENDPOINT\e[0m"
-if curl -fs "$HTTP_ENDPOINT" &>/dev/null; then
+if curl -fs --max-time 5 "$HTTP_ENDPOINT" &>/dev/null; then
   echo -e "\e[91m✅ HTTP endpoint is responsive.\e[0m"
 else
   echo -e "\e[91m⚠️ HTTP endpoint is not responding.\e[0m"
   echo -e "\e[91mThis may indicate the node is running but not serving traffic.\e[0m"
   echo -e "\e[91mCheck if the port is correct or if the node exposes a health route.\e[0m"
+  echo -e "\e[91mRecent logs:\e[0m"
+  journalctl -u "$UNIT_NAME" --no-pager -n 40
 fi
