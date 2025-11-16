@@ -1,6 +1,6 @@
 #!/bin/bash
 # Step 07: Finalize Demos Node installation
-# Configures .env in /opt/demos-node, resolves DB port conflicts, sets peer list, and backs up identity keys.
+# Configures .env in /opt/demos-node, resolves DB port issues, sets peer list, backs up identity keys, and ensures clean restarts.
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -8,6 +8,7 @@ IFS=$'\n\t'
 echo -e "\e[91m🎉 [07] Finalizing installation...\e[0m"
 echo -e "\e[91mYou're almost done! Let's wrap things up.\e[0m"
 
+# === Markers ===
 MARKER_DIR="/root/.demos_node_setup"
 STEP_MARKER="$MARKER_DIR/07_finalize.done"
 mkdir -p "$MARKER_DIR"
@@ -23,25 +24,18 @@ echo -e "\e[91m🔍 Check status: check_demos_node --status\e[0m"
 echo -e "\e[91m🔄 Restart node: restart_demos_node\e[0m"
 echo -e "\e[91m📦 View logs: sudo journalctl -u demos-node --no-pager --since \"10 minutes ago\"\e[0m"
 
-# === Detect port conflicts ===
+# === Defaults ===
 DEFAULT_NODE_PORT=53550
 DEFAULT_DB_PORT=5332
 
+# === Detect port conflicts (Node port) ===
 echo -e "\e[91m🔍 Checking for port conflicts...\e[0m"
 if ss -tuln | grep -q ":$DEFAULT_NODE_PORT "; then
   echo -e "\e[91m⚠️ Port $DEFAULT_NODE_PORT is already in use.\e[0m"
-  read -p "👉 Enter a different port for the node: " CUSTOM_NODE_PORT
+  read -p "👉 Enter a different port for the node (default $DEFAULT_NODE_PORT): " CUSTOM_NODE_PORT
   CUSTOM_NODE_PORT=${CUSTOM_NODE_PORT:-$DEFAULT_NODE_PORT}
 else
   CUSTOM_NODE_PORT=$DEFAULT_NODE_PORT
-fi
-
-if ss -tuln | grep -q ":$DEFAULT_DB_PORT "; then
-  echo -e "\e[91m⚠️ Port $DEFAULT_DB_PORT is already in use.\e[0m"
-  read -p "👉 Enter a different port for the DB (default $DEFAULT_DB_PORT): " CUSTOM_DB_PORT
-  CUSTOM_DB_PORT=${CUSTOM_DB_PORT:-$DEFAULT_DB_PORT}
-else
-  CUSTOM_DB_PORT=$DEFAULT_DB_PORT
 fi
 
 # === Helpers ===
@@ -58,7 +52,6 @@ safe_set_env() {
 }
 
 detect_public_ip() {
-  # Prefer IPv4, fallback IPv6, then localhost
   local ip
   ip="$(curl -4 -s ifconfig.co || true)"
   if [ -z "$ip" ]; then
@@ -77,10 +70,20 @@ url_from_ip_port() {
   fi
 }
 
+kill_port_if_listening() {
+  local port="$1"
+  sudo lsof -ti :"$port" | xargs -r sudo kill -9 || true
+  sleep 2
+  if ss -tuln | grep -q ":$port "; then
+    return 1
+  else
+    return 0
+  fi
+}
+
 # === Configure .env in /opt/demos-node ===
 if [ ! -f "$ENV_PATH" ]; then
   echo -e "\e[91m🔧 Generating .env configuration...\e[0m"
-
   if [ -f /opt/demos-node/env.example ]; then
     cp /opt/demos-node/env.example "$ENV_PATH"
     echo -e "\e[91m✅ Loaded template from /opt/demos-node/env.example\e[0m"
@@ -100,29 +103,24 @@ echo -e "\e[91m🔧 Setting EXPOSED_URL to: $DEFAULT_URL\e[0m"
 
 safe_set_env "EXPOSED_URL" "$DEFAULT_URL"
 safe_set_env "NODE_PORT" "$CUSTOM_NODE_PORT"
-safe_set_env "DB_PORT" "$CUSTOM_DB_PORT"
 
-# === Kill conflicting PostgreSQL process based on .env DB_PORT ===
-DB_PORT=$(grep "^DB_PORT=" "$ENV_PATH" | cut -d'=' -f2)
-DB_PORT=${DB_PORT:-$DEFAULT_DB_PORT}
-echo -e "\e[91mℹ️ Using DB_PORT from .env: $DB_PORT\e[0m"
+# Determine DB port (allow override via existing env)
+ENV_DB_PORT="$(grep "^DB_PORT=" "$ENV_PATH" | cut -d'=' -f2 || true)"
+DB_PORT="${ENV_DB_PORT:-$DEFAULT_DB_PORT}"
+safe_set_env "DB_PORT" "$DB_PORT"
+echo -e "\e[91mℹ️ Using DB_PORT: $DB_PORT\e[0m"
 
-if ss -tuln | grep -q ":$DB_PORT "; then
-  echo -e "\e[91m⚠️ Port $DB_PORT appears to be in use.\e[0m"
-  OWNER=$(sudo lsof -iTCP -sTCP:LISTEN -P -n | awk -v p=":$DB_PORT" '$9 ~ p {print $1}' | head -n1)
-  echo -e "\e[91m🔎 Detected process: ${OWNER:-unknown} on $DB_PORT\e[0m"
-  echo -e "\e[91m🔪 Attempting to stop process on port $DB_PORT...\e[0m"
-  sudo lsof -ti :$DB_PORT | xargs -r sudo kill -9 || true
-  sleep 1
-  if ss -tuln | grep -q ":$DB_PORT "; then
-    echo -e "\e[91m❌ Could not free DB port $DB_PORT. Please resolve manually and re-run.\e[0m"
+# === Ensure DB port is free BEFORE first restart ===
+echo -e "\e[91m🔪 Ensuring PostgreSQL on port $DB_PORT is stopped before restart...\e[0m"
+if ! kill_port_if_listening "$DB_PORT"; then
+  echo -e "\e[91m❌ Port $DB_PORT is still occupied. Attempting to stop system PostgreSQL service...\e[0m"
+  sudo systemctl stop postgresql >/dev/null 2>&1 || true
+  if ! kill_port_if_listening "$DB_PORT"; then
+    echo -e "\e[91m❌ PostgreSQL still bound to port $DB_PORT. Please stop it manually and re-run.\e[0m"
     exit 1
-  else
-    echo -e "\e[91m✅ Port $DB_PORT is now free.\e[0m"
   fi
-else
-  echo -e "\e[91m✅ No conflict detected on DB port $DB_PORT.\e[0m"
 fi
+echo -e "\e[91m✅ Port $DB_PORT is free.\e[0m"
 
 # === Start node to trigger key generation ===
 echo -e "\e[91m🚀 Starting Demos Node to generate identity keys...\e[0m"
@@ -146,8 +144,7 @@ done
 
 if [ "$WAITED" -ge "$MAX_WAIT" ]; then
   echo -e "\e[91m❌ Identity keys were not generated within $(($MAX_WAIT/60)) minutes.\e[0m"
-  echo -e "\e[91m❌ Node setup is incomplete. demos_peerlist.json cannot be configured without keys.\e[0m"
-  echo -e "\e[91mPlease check the node logs and restart manually:\e[0m"
+  echo -e "\e[91mPlease check logs:\e[0m"
   echo -e "\e[91msudo journalctl -u demos-node --no-pager --since \"10 minutes ago\"\e[0m"
   exit 1
 fi
@@ -159,16 +156,29 @@ PEERLIST_PATH="/opt/demos-node/demos_peerlist.json"
 PUBKEY_FILE=$(ls publickey_ed25519_* 2>/dev/null | head -n 1)
 
 if [ -n "$PUBKEY_FILE" ]; then
-  PUBKEY_HEX=$(echo "$PUBKEY_FILE" | sed 's/publickey_ed25519_//')
-  EXPOSED_URL=$(grep "^EXPOSED_URL=" "$ENV_PATH" | cut -d'=' -f2)
+  PUBKEY_HEX="$(echo "$PUBKEY_FILE" | sed 's/publickey_ed25519_//')"
+  # Normalize: remove accidental leading 0x if present
+  PUBKEY_HEX="${PUBKEY_HEX#0x}"
 
-  if [ -z "$EXPOSED_URL" ]; then
-    EXPOSED_URL="$(url_from_ip_port "$PUBLIC_IP" "$CUSTOM_NODE_PORT")"
+  EXPOSED_URL_VAL="$(grep "^EXPOSED_URL=" "$ENV_PATH" | cut -d'=' -f2)"
+  if [ -z "$EXPOSED_URL_VAL" ]; then
+    EXPOSED_URL_VAL="$(url_from_ip_port "$PUBLIC_IP" "$CUSTOM_NODE_PORT")"
   fi
 
-  echo "{ \"0x$PUBKEY_HEX\": \"$EXPOSED_URL\" }" > "$PEERLIST_PATH"
+  echo "{ \"0x$PUBKEY_HEX\": \"$EXPOSED_URL_VAL\" }" > "$PEERLIST_PATH"
   echo -e "\e[91m✅ Peer list created for 0x$PUBKEY_HEX\e[0m"
-  echo -e "\e[91m🌐 Advertised URL: $EXPOSED_URL\e[0m"
+  echo -e "\e[91m🌐 Advertised URL: $EXPOSED_URL_VAL\e[0m"
+
+  # === Ensure DB port is free BEFORE applying peer list restart ===
+  echo -e "\e[91m🔪 Ensuring PostgreSQL on port $DB_PORT is stopped before applying peer list...\e[0m"
+  if ! kill_port_if_listening "$DB_PORT"; then
+    sudo systemctl stop postgresql >/dev/null 2>&1 || true
+    if ! kill_port_if_listening "$DB_PORT"; then
+      echo -e "\e[91m❌ PostgreSQL still bound to port $DB_PORT. Please stop it manually and re-run.\e[0m"
+      exit 1
+    fi
+  fi
+  echo -e "\e[91m✅ Port $DB_PORT is free.\e[0m"
 
   echo -e "\e[91m🔄 Restarting node to apply peer list changes...\e[0m"
   systemctl restart demos-node
@@ -180,10 +190,8 @@ fi
 echo -e "\e[91m📁 Backing up identity keys...\e[0m"
 BACKUP_DIR="/root/demos_node_backups/backup_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$BACKUP_DIR"
-
 cp /opt/demos-node/.demos_identity "$BACKUP_DIR/" 2>/dev/null || echo -e "\e[91m⚠️ No .demos_identity file found.\e[0m"
 cp /opt/demos-node/publickey_ed25519_* "$BACKUP_DIR/" 2>/dev/null || echo -e "\e[91m⚠️ No publickey file found.\e[0m"
-
 echo -e "\e[91m✅ Keys backed up to: $BACKUP_DIR\e[0m"
 
 # === Final health checks ===
