@@ -7,7 +7,17 @@ IFS=$'\n\t'
 
 SERVICE_NAME="demos-node"
 UNIT_NAME="${SERVICE_NAME}.service"
-HTTP_ENDPOINT="http://localhost:8080/health"  # Adjust if needed
+
+# === Determine HTTP endpoint dynamically from .env ===
+ENV_PATH="/opt/demos-node/.env"
+if [ -f "$ENV_PATH" ]; then
+  NODE_PORT=$(grep "^NODE_PORT=" "$ENV_PATH" | cut -d'=' -f2)
+  PUBLIC_IP=$(curl -s ifconfig.me || echo "localhost")
+  HTTP_ENDPOINT="http://$PUBLIC_IP:$NODE_PORT/health"
+else
+  # Fallback if .env not found
+  HTTP_ENDPOINT="http://localhost:53550/health"
+fi
 
 # === Systemd & journalctl checks ===
 if ! command -v systemctl &>/dev/null; then
@@ -44,26 +54,12 @@ check_health() {
 
   echo -e "\e[91m🧠 Systemd Status: $STATUS\e[0m"
   case "$STATUS" in
-    active)
-      echo -e "\e[91m✅ Service is running normally.\e[0m"
-      ;;
-    inactive)
-      echo -e "\e[91m⚠️ Service is installed but not running. Attempting auto-repair...\e[0m"
-      restart_node
-      ;;
-    failed)
-      echo -e "\e[91m❌ Service has crashed. Attempting auto-repair...\e[0m"
-      restart_node
-      ;;
-    activating)
-      echo -e "\e[91m⏳ Service is starting. Wait a moment and recheck.\e[0m"
-      ;;
-    deactivating)
-      echo -e "\e[91m⏸️ Service is shutting down.\e[0m"
-      ;;
-    *)
-      echo -e "\e[91m❓ Unknown status: $STATUS\e[0m"
-      ;;
+    active) echo -e "\e[91m✅ Service is running normally.\e[0m" ;;
+    inactive) echo -e "\e[91m⚠️ Service is installed but not running. Attempting auto-repair...\e[0m"; restart_node ;;
+    failed) echo -e "\e[91m❌ Service has crashed. Attempting auto-repair...\e[0m"; restart_node ;;
+    activating) echo -e "\e[91m⏳ Service is starting. Wait a moment and recheck.\e[0m" ;;
+    deactivating) echo -e "\e[91m⏸️ Service is shutting down.\e[0m" ;;
+    *) echo -e "\e[91m❓ Unknown status: $STATUS\e[0m" ;;
   esac
 
   if [[ "$PID" =~ ^[0-9]+$ ]] && [ "$PID" -gt 0 ]; then
