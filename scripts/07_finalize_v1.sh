@@ -1,6 +1,7 @@
 #!/bin/bash
 # Step 07: Finalize Demos Node installation
-# Configures .env in /opt/demos-node, resolves DB port issues, sets peer list, backs up identity keys, and ensures clean restarts.
+# Configures .env in /opt/demos-node, resolves DB port issues, sets peer list,
+# backs up identity keys, ensures clean restarts, verifies helper scripts, and runs a smoke test.
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -21,6 +22,7 @@ fi
 # === Defaults ===
 DEFAULT_NODE_PORT=53550
 DEFAULT_DB_PORT=5332
+ENV_PATH="/opt/demos-node/.env"
 
 # === Detect port conflicts (Node port) ===
 echo -e "\e[91m🔍 Checking for port conflicts...\e[0m"
@@ -33,8 +35,6 @@ else
 fi
 
 # === Helpers ===
-ENV_PATH="/opt/demos-node/.env"
-
 safe_set_env() {
   local key="$1"
   local val="$2"
@@ -151,28 +151,14 @@ PUBKEY_FILE=$(ls publickey_ed25519_* 2>/dev/null | head -n 1)
 
 if [ -n "$PUBKEY_FILE" ]; then
   PUBKEY_HEX="$(echo "$PUBKEY_FILE" | sed 's/publickey_ed25519_//')"
-  # Normalize: remove accidental leading 0x if present
   PUBKEY_HEX="${PUBKEY_HEX#0x}"
 
   EXPOSED_URL_VAL="$(grep "^EXPOSED_URL=" "$ENV_PATH" | cut -d'=' -f2)"
-  if [ -z "$EXPOSED_URL_VAL" ]; then
-    EXPOSED_URL_VAL="$(url_from_ip_port "$PUBLIC_IP" "$CUSTOM_NODE_PORT")"
-  fi
+  [ -z "$EXPOSED_URL_VAL" ] && EXPOSED_URL_VAL="$(url_from_ip_port "$PUBLIC_IP" "$CUSTOM_NODE_PORT")"
 
   echo "{ \"0x$PUBKEY_HEX\": \"$EXPOSED_URL_VAL\" }" > "$PEERLIST_PATH"
   echo -e "\e[91m✅ Peer list created for 0x$PUBKEY_HEX\e[0m"
   echo -e "\e[91m🌐 Advertised URL: $EXPOSED_URL_VAL\e[0m"
-
-  # === Ensure DB port is free BEFORE applying peer list restart ===
-  echo -e "\e[91m🔪 Ensuring PostgreSQL on port $DB_PORT is stopped before applying peer list...\e[0m"
-  if ! kill_port_if_listening "$DB_PORT"; then
-    sudo systemctl stop postgresql >/dev/null 2>&1 || true
-    if ! kill_port_if_listening "$DB_PORT"; then
-      echo -e "\e[91m❌ PostgreSQL still bound to port $DB_PORT. Please stop it manually and re-run.\e[0m"
-      exit 1
-    fi
-  fi
-  echo -e "\e[91m✅ Port $DB_PORT is free.\e[0m"
 
   echo -e "\e[91m🔄 Restarting node to apply peer list changes...\e[0m"
   systemctl restart demos-node
@@ -198,7 +184,28 @@ else
   exit 1
 fi
 
+# === Verify helper scripts are callable ===
+echo -e "\e[91m🧰 Verifying helper scripts...\e[0m"
+HELPERS=("check_demos_node" "restart_demos_node" "logs_demos_node" "backup_demos_keys" "stop_demos_node")
+for helper in "${HELPERS[@]}"; do
+  if command -v "$helper" &>/dev/null; then
+    echo -e "\e[91m✅ $helper is installed and in PATH.\e[0m"
+  else
+    echo -e "\e[91m❌ $helper not found. Ensure Step 06 ran successfully.\e[0m"
+    exit 1
+  fi
+done
+
+# === Smoke test: show status and health ===
+echo -e "\e[91m🚦 Smoke test: helper outputs\e[0m"
+if command -v check_demos_node &>/dev/null; then
+  check_demos_node --status || true
+fi
+if command -v logs_demos_node &>/dev/null; then
+  logs_demos_node --health || true
+fi
+
 # === Done ===
 touch "$STEP_MARKER"
 echo -e "\e[91m✅ [07] Finalization completed successfully.\e[0m"
-echo -e "\e[91m🎉 Your Demos Node is configured, keys backed up, and peer list set.\e[0m"
+echo -e "\e[91m🎉 Your Demos Node is configured, keys backed up, peer list set, and helpers verified.\e[0m"
