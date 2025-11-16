@@ -11,10 +11,17 @@ UNIT_NAME="${SERVICE_NAME}.service"
 # === Load .env variables ===
 ENV_FILE="/opt/demos-node/.env"
 if [ -f "$ENV_FILE" ]; then
-  export $(grep -E '^(NODE_PORT|EXPOSED_URL)=' "$ENV_FILE" | xargs)
+  NODE_PORT=$(grep "^NODE_PORT=" "$ENV_FILE" | cut -d'=' -f2)
+  EXPOSED_URL=$(grep "^EXPOSED_URL=" "$ENV_FILE" | cut -d'=' -f2)
+  # Fallback if EXPOSED_URL is missing
+  if [ -z "$EXPOSED_URL" ]; then
+    PUBLIC_IP=$(curl -s ifconfig.me || echo "localhost")
+    EXPOSED_URL="http://$PUBLIC_IP:$NODE_PORT"
+  fi
 else
   NODE_PORT=53550
-  EXPOSED_URL="http://localhost:$NODE_PORT"
+  PUBLIC_IP=$(curl -s ifconfig.me || echo "localhost")
+  EXPOSED_URL="http://$PUBLIC_IP:$NODE_PORT"
 fi
 
 HTTP_ENDPOINT="${EXPOSED_URL}/health"
