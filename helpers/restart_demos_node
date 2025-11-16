@@ -1,53 +1,144 @@
 #!/bin/bash
 # This helper script restarts the Demos Node systemd service.
-# It ensures the node is restarted cleanly and confirms the new status.
+# It ensures the node is restarted cleanly, frees DB port if needed,
+# and confirms the new status. Supports optional --force for aggressive cleanup.
 
-set -u
+set -euo pipefail
 IFS=$'\n\t'
 
 SERVICE_NAME="demos-node"
 UNIT_NAME="${SERVICE_NAME}.service"
+ENV_FILE="/opt/demos-node/.env"
 
-echo -e "\e[91m🔄 Restarting Demos Node service: $UNIT_NAME\e[0m"
+# Defaults
+NODE_PORT=53550
+DB_PORT=5332
+FORCE=false
+RETRY_COUNT=2
+SLEEP_BETWEEN=2
 
-# === Check if systemd is available ===
+# Parse optional flag
+for arg in "$@"; do
+  case "$arg" in
+    --force) FORCE=true ;;
+    *) ;;
+  esac
+done
+
+log() { echo -e "\e[91m$*\e[0m"; }
+
+# Load env if present
+if [ -f "$ENV_FILE" ]; then
+  NODE_PORT=$(grep -m1 "^NODE_PORT=" "$ENV_FILE" | cut -d'=' -f2 || echo "$NODE_PORT")
+  DB_PORT=$(grep -m1 "^DB_PORT=" "$ENV_FILE" | cut -d'=' -f2 || echo "$DB_PORT")
+fi
+
+kill_port_if_listening() {
+  local port="$1"
+  # Try to politely stop processes via systemd first (if it's postgres)
+  if ss -tuln | grep -q ":$port "; then
+    log "🔪 Port $port is in use — listing holders:"
+    ss -tulnpt | grep ":$port " || true
+    # attempt to stop system postgresql (may be the common case)
+    if systemctl list-units --type=service --all | grep -q '^postgresql'; then
+      log "⏸️ Attempting to stop system postgresql.service..."
+      sudo systemctl stop postgresql >/dev/null 2>&1 || true
+      sleep 1
+    fi
+    # If still present, optionally kill processes owning the port
+    if ss -tuln | grep -q ":$port "; then
+      if [ "$FORCE" = true ]; then
+        log "💀 Force mode: killing processes bound to port $port"
+        sudo lsof -ti :"$port" | xargs -r sudo kill -9 || true
+        sleep 1
+      else
+        return 1
+      fi
+    fi
+  fi
+  return 0
+}
+
+# Pre-checks
 if ! command -v systemctl &>/dev/null; then
-  echo -e "\e[91m❌ systemctl not found. This system may not support systemd.\e[0m"
+  log "❌ systemctl not found. This system may not support systemd."
   exit 1
 fi
-
-# === Check if service exists ===
 if ! systemctl show "$UNIT_NAME" &>/dev/null; then
-  echo -e "\e[91m❌ Service $UNIT_NAME not found.\e[0m"
-  echo -e "\e[91mMake sure the node was installed and the service was created.\e[0m"
+  log "❌ Service $UNIT_NAME not found. Make sure the node was installed and service created."
   exit 1
 fi
 
-# === Restart the service ===
-echo -e "\e[91m🔧 Restarting service...\e[0m"
-if systemctl restart "$UNIT_NAME"; then
-  echo -e "\e[91m✅ Service restart command issued.\e[0m"
-else
-  echo -e "\e[91m❌ Failed to restart service.\e[0m"
-  echo -e "\e[91mTry manually:\e[0m"
-  echo -e "\e[91msudo systemctl restart $UNIT_NAME\e[0m"
+log "🔄 Restarting Demos Node service: $UNIT_NAME"
+log "ℹ️ Using NODE_PORT=$NODE_PORT DB_PORT=$DB_PORT (from $ENV_FILE if present)"
+
+# Ensure DB port free before restart (common source of failures)
+if ! kill_port_if_listening "$DB_PORT"; then
+  log "⚠️ DB port $DB_PORT still occupied. Rerun with --force to kill holders, or stop them manually."
   exit 1
 fi
+log "✅ DB port $DB_PORT free (or no action needed)."
 
-# === Confirm new status ===
-sleep 2
-STATUS=$(systemctl is-active "$UNIT_NAME")
-PID=$(systemctl show -p MainPID "$UNIT_NAME" | cut -d= -f2 || echo 0)
-PID=${PID:-0}
+attempt_restart() {
+  if systemctl restart "$UNIT_NAME"; then
+    log "✅ Service restart command issued."
+    return 0
+  else
+    log "❌ systemctl restart failed."
+    return 1
+  fi
+}
 
-if [ "$STATUS" = "active" ]; then
-  echo -e "\e[91m✅ Demos Node is running.\e[0m"
-  echo -e "\e[91m🧬 Main PID after restart: $PID\e[0m"
+# Try restart with retries
+i=0
+while [ $i -lt $RETRY_COUNT ]; do
+  if attempt_restart; then
+    sleep "$SLEEP_BETWEEN"
+    STATUS=$(systemctl is-active "$UNIT_NAME" || echo "unknown")
+    if [ "$STATUS" = "active" ]; then
+      PID=$(systemctl show -p MainPID "$UNIT_NAME" | cut -d= -f2 || echo 0)
+      PID=${PID:-0}
+      log "✅ Demos Node is running. Main PID after restart: $PID"
+      exit 0
+    fi
+  fi
+  i=$((i+1))
+  log "🔁 Retry $i/$RETRY_COUNT will run after $SLEEP_BETWEEN seconds..."
+  sleep "$SLEEP_BETWEEN"
+done
+
+# If restart failed, try full stop + start fallback
+log "🔧 Restart attempts failed. Falling back to stop + start sequence."
+log "🛑 Stopping $UNIT_NAME..."
+systemctl stop "$UNIT_NAME" || true
+sleep 1
+
+# Extra cleanup if force
+if [ "$FORCE" = true ]; then
+  log "💀 Force: killing any lingering demos-node processes and freeing ports..."
+  pgrep -f "/opt/demos-node" | xargs -r sudo kill -9 || true
+  sudo lsof -ti :"$NODE_PORT" | xargs -r sudo kill -9 || true
+  sudo lsof -ti :"$DB_PORT" | xargs -r sudo kill -9 || true
+  sleep 1
+fi
+
+log "▶️ Starting $UNIT_NAME..."
+if systemctl start "$UNIT_NAME"; then
+  sleep 2
+  STATUS=$(systemctl is-active "$UNIT_NAME" || echo "unknown")
+  PID=$(systemctl show -p MainPID "$UNIT_NAME" | cut -d= -f2 || echo 0)
+  PID=${PID:-0}
+  if [ "$STATUS" = "active" ]; then
+    log "✅ Start successful. Main PID: $PID"
+    exit 0
+  else
+    log "⚠️ Service started but not active. Status: $STATUS"
+    log "📜 Recent logs (tail 40):"
+    journalctl -u "$UNIT_NAME" --no-pager -n 40 || true
+    exit 1
+  fi
 else
-  echo -e "\e[91m⚠️ Service restarted but is not active. Status: $STATUS\e[0m"
-  echo -e "\e[91mRecent logs:\e[0m"
-  journalctl -u "$UNIT_NAME" --no-pager -n 20
-  echo -e "\e[91m👉 Check logs above for errors and try:\e[0m"
-  echo -e "\e[91msudo systemctl restart $UNIT_NAME\e[0m"
+  log "❌ Failed to start $UNIT_NAME. Showing recent logs:"
+  journalctl -u "$UNIT_NAME" --no-pager -n 60 || true
   exit 1
 fi
