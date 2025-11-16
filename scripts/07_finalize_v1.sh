@@ -31,20 +31,53 @@ echo -e "\e[91m🔍 Checking for port conflicts...\e[0m"
 if ss -tuln | grep -q ":$DEFAULT_NODE_PORT "; then
   echo -e "\e[91m⚠️ Port $DEFAULT_NODE_PORT is already in use.\e[0m"
   read -p "👉 Enter a different port for the node: " CUSTOM_NODE_PORT
+  CUSTOM_NODE_PORT=${CUSTOM_NODE_PORT:-$DEFAULT_NODE_PORT}
 else
   CUSTOM_NODE_PORT=$DEFAULT_NODE_PORT
 fi
 
 if ss -tuln | grep -q ":$DEFAULT_DB_PORT "; then
   echo -e "\e[91m⚠️ Port $DEFAULT_DB_PORT is already in use.\e[0m"
-  CUSTOM_DB_PORT=$DEFAULT_DB_PORT
+  read -p "👉 Enter a different port for the DB (default $DEFAULT_DB_PORT): " CUSTOM_DB_PORT
+  CUSTOM_DB_PORT=${CUSTOM_DB_PORT:-$DEFAULT_DB_PORT}
 else
   CUSTOM_DB_PORT=$DEFAULT_DB_PORT
 fi
 
-# === Configure .env in /opt/demos-node ===
+# === Helpers ===
 ENV_PATH="/opt/demos-node/.env"
 
+safe_set_env() {
+  local key="$1"
+  local val="$2"
+  if [ -f "$ENV_PATH" ] && grep -q "^${key}=" "$ENV_PATH"; then
+    sed -i "s|^${key}=.*|${key}=${val}|" "$ENV_PATH"
+  else
+    echo "${key}=${val}" >> "$ENV_PATH"
+  fi
+}
+
+detect_public_ip() {
+  # Prefer IPv4, fallback IPv6, then localhost
+  local ip
+  ip="$(curl -4 -s ifconfig.co || true)"
+  if [ -z "$ip" ]; then
+    ip="$(curl -6 -s ifconfig.co || true)"
+  fi
+  echo "${ip:-localhost}"
+}
+
+url_from_ip_port() {
+  local ip="$1"
+  local port="$2"
+  if [[ "$ip" == *:* ]]; then
+    echo "http://[$ip]:$port"
+  else
+    echo "http://$ip:$port"
+  fi
+}
+
+# === Configure .env in /opt/demos-node ===
 if [ ! -f "$ENV_PATH" ]; then
   echo -e "\e[91m🔧 Generating .env configuration...\e[0m"
 
@@ -55,35 +88,38 @@ if [ ! -f "$ENV_PATH" ]; then
     touch "$ENV_PATH"
     echo -e "\e[91m⚠️ env.example not found. Creating empty .env\e[0m"
   fi
-
-  PUBLIC_IP=$(curl -s ifconfig.me || echo "localhost")
-  DEFAULT_URL="http://$PUBLIC_IP:$CUSTOM_NODE_PORT"
-
-  echo -e "\e[91m🌐 Detected public IP: $PUBLIC_IP\e[0m"
-  echo -e "\e[91m🔧 Setting EXPOSED_URL to: $DEFAULT_URL\e[0m"
-
-  sed -i "s|^EXPOSED_URL=.*|EXPOSED_URL=$DEFAULT_URL|" "$ENV_PATH" || echo "EXPOSED_URL=$DEFAULT_URL" >> "$ENV_PATH"
-  sed -i "s|^NODE_PORT=.*|NODE_PORT=$CUSTOM_NODE_PORT|" "$ENV_PATH" || echo "NODE_PORT=$CUSTOM_NODE_PORT" >> "$ENV_PATH"
-  sed -i "s|^DB_PORT=.*|DB_PORT=$CUSTOM_DB_PORT|" "$ENV_PATH" || echo "DB_PORT=$CUSTOM_DB_PORT" >> "$ENV_PATH"
-else
-  echo -e "\e[91m✅ .env already exists at $ENV_PATH. Skipping...\e[0m"
 fi
 
-# === Kill conflicting PostgreSQL process based on .env DB_PORT ===
-if [ -f "$ENV_PATH" ]; then
-  DB_PORT=$(grep "^DB_PORT=" "$ENV_PATH" | cut -d'=' -f2)
-  echo -e "\e[91mℹ️ Using DB_PORT from .env: $DB_PORT\e[0m"
+PUBLIC_IP="$(detect_public_ip)"
+DEFAULT_URL="$(url_from_ip_port "$PUBLIC_IP" "$CUSTOM_NODE_PORT")"
 
+echo -e "\e[91m🌐 Detected public IP: $PUBLIC_IP\e[0m"
+echo -e "\e[91m🔧 Setting EXPOSED_URL to: $DEFAULT_URL\e[0m"
+
+safe_set_env "EXPOSED_URL" "$DEFAULT_URL"
+safe_set_env "NODE_PORT" "$CUSTOM_NODE_PORT"
+safe_set_env "DB_PORT" "$CUSTOM_DB_PORT"
+
+# === Kill conflicting PostgreSQL process based on .env DB_PORT ===
+DB_PORT=$(grep "^DB_PORT=" "$ENV_PATH" | cut -d'=' -f2)
+DB_PORT=${DB_PORT:-$DEFAULT_DB_PORT}
+echo -e "\e[91mℹ️ Using DB_PORT from .env: $DB_PORT\e[0m"
+
+if ss -tuln | grep -q ":$DB_PORT "; then
+  echo -e "\e[91m⚠️ Port $DB_PORT appears to be in use.\e[0m"
+  OWNER=$(sudo lsof -iTCP -sTCP:LISTEN -P -n | awk -v p=":$DB_PORT" '$9 ~ p {print $1}' | head -n1)
+  echo -e "\e[91m🔎 Detected process: ${OWNER:-unknown} on $DB_PORT\e[0m"
+  echo -e "\e[91m🔪 Attempting to stop process on port $DB_PORT...\e[0m"
+  sudo lsof -ti :$DB_PORT | xargs -r sudo kill -9 || true
+  sleep 1
   if ss -tuln | grep -q ":$DB_PORT "; then
-    echo -e "\e[91m⚠️ Port $DB_PORT is already in use by PostgreSQL.\e[0m"
-    echo -e "\e[91m🔪 Killing PostgreSQL process bound to port $DB_PORT...\e[0m"
-    sudo lsof -ti :$DB_PORT | xargs -r sudo kill -9 || true
-    echo -e "\e[91m✅ PostgreSQL process on port $DB_PORT terminated.\e[0m"
+    echo -e "\e[91m❌ Could not free DB port $DB_PORT. Please resolve manually and re-run.\e[0m"
+    exit 1
   else
-    echo -e "\e[91m✅ No PostgreSQL conflict detected on port $DB_PORT.\e[0m"
+    echo -e "\e[91m✅ Port $DB_PORT is now free.\e[0m"
   fi
 else
-  echo -e "\e[91mℹ️ No .env found yet — skipping DB port check.\e[0m"
+  echo -e "\e[91m✅ No conflict detected on DB port $DB_PORT.\e[0m"
 fi
 
 # === Start node to trigger key generation ===
@@ -92,7 +128,7 @@ systemctl restart demos-node
 
 # === Wait for identity keys ===
 echo -e "\e[91m⏳ Waiting for identity keys to be generated...\e[0m"
-MAX_WAIT=120
+MAX_WAIT=180
 INTERVAL=10
 WAITED=0
 
@@ -107,14 +143,14 @@ while [ "$WAITED" -lt "$MAX_WAIT" ]; do
 done
 
 if [ "$WAITED" -ge "$MAX_WAIT" ]; then
-  echo -e "\e[91m❌ Identity keys were not generated within 2 minutes.\e[0m"
+  echo -e "\e[91m❌ Identity keys were not generated within $(($MAX_WAIT/60)) minutes.\e[0m"
   echo -e "\e[91m❌ Node setup is incomplete. demos_peerlist.json cannot be configured without keys.\e[0m"
   echo -e "\e[91mPlease check the node logs and restart manually:\e[0m"
   echo -e "\e[91msudo journalctl -u demos-node --no-pager --since \"10 minutes ago\"\e[0m"
   exit 1
 fi
 
-# === Configure demos_peerlist.json ===
+# === Configure demos_peerlist.json from EXPOSED_URL ===
 echo -e "\e[91m🔗 Configuring demos_peerlist.json with this node's public key...\e[0m"
 cd /opt/demos-node
 PEERLIST_PATH="/opt/demos-node/demos_peerlist.json"
@@ -122,12 +158,14 @@ PUBKEY_FILE=$(ls publickey_ed25519_* 2>/dev/null | head -n 1)
 
 if [ -n "$PUBKEY_FILE" ]; then
   PUBKEY_HEX=$(echo "$PUBKEY_FILE" | sed 's/publickey_ed25519_//')
-  NODE_IP=$(hostname -I | awk '{print $1}')
-  NODE_PORT=$(grep "^NODE_PORT=" "$ENV_PATH" | cut -d'=' -f2 2>/dev/null || echo "53550")
-  NODE_URL="http://$NODE_IP:$NODE_PORT"
+  EXPOSED_URL=$(grep "^EXPOSED_URL=" "$ENV_PATH" | cut -d'=' -f2)
+  if [ -z "$EXPOSED_URL" ]; if missing
+    EXPOSED_URL="$(url_from_ip_port "$PUBLIC_IP" "$CUSTOM_NODE_PORT")"
+  fi
 
-  echo "{ \"0x$PUBKEY_HEX\": \"$NODE_URL\" }" > "$PEERLIST_PATH"
-  echo -e "\e[91m✅ Peer list created with this node: 0x$PUBKEY_HEX\e[0m"
+  echo "{ \"0x$PUBKEY_HEX\": \"$EXPOSED_URL\" }" > "$PEERLIST_PATH"
+  echo -e "\e[91m✅ Peer list created for 0x$PUBKEY_HEX\e[0m"
+  echo -e "\e[91m🌐 Advertised URL: $EXPOSED_URL\e[0m"
 
   echo -e "\e[91m🔄 Restarting node to apply peer list changes...\e[0m"
   systemctl restart demos-node
@@ -145,4 +183,17 @@ cp /opt/demos-node/publickey_ed25519_* "$BACKUP_DIR/" 2>/dev/null || echo -e "\e
 
 echo -e "\e[91m✅ Keys backed up to: $BACKUP_DIR\e[0m"
 
+# === Final health checks ===
+echo -e "\e[91m🔎 Running final health checks...\e[0m"
+if systemctl is-active --quiet demos-node; then
+  echo -e "\e[91m✅ Service active.\e[0m"
+else
+  echo -e "\e[91m❌ Service not active.\e[0m"
+  sudo journalctl -u demos-node --no-pager --since "5 minutes ago" || true
+  exit 1
+fi
+
+# === Done ===
 touch "$STEP_MARKER"
+echo -e "\e[91m✅ [07] Finalization completed successfully.\e[0m"
+echo -e "\e[91m🎉 Your Demos Node is configured, keys backed up, and peer list set.\e[0m"
