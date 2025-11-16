@@ -18,12 +18,6 @@ if [ -f "$STEP_MARKER" ]; then
   exit 0
 fi
 
-echo -e "\e[91m✅ Demos Node is now fully installed and running as a systemd service.\e[0m"
-echo -e "\e[91mYou can manage it using the helper tools installed:\e[0m"
-echo -e "\e[91m🔍 Check status: check_demos_node --status\e[0m"
-echo -e "\e[91m🔄 Restart node: restart_demos_node\e[0m"
-echo -e "\e[91m📦 View logs: sudo journalctl -u demos-node --no-pager --since \"10 minutes ago\"\e[0m"
-
 # === Defaults ===
 DEFAULT_NODE_PORT=53550
 DEFAULT_DB_PORT=5332
