@@ -88,6 +88,8 @@ if [ ! -f "$ENV_PATH" ]; then
     touch "$ENV_PATH"
     echo -e "\e[91m⚠️ env.example not found. Creating empty .env\e[0m"
   fi
+else
+  echo -e "\e[91mℹ️ .env exists. Updating critical keys...\e[0m"
 fi
 
 PUBLIC_IP="$(detect_public_ip)"
@@ -159,7 +161,8 @@ PUBKEY_FILE=$(ls publickey_ed25519_* 2>/dev/null | head -n 1)
 if [ -n "$PUBKEY_FILE" ]; then
   PUBKEY_HEX=$(echo "$PUBKEY_FILE" | sed 's/publickey_ed25519_//')
   EXPOSED_URL=$(grep "^EXPOSED_URL=" "$ENV_PATH" | cut -d'=' -f2)
-  if [ -z "$EXPOSED_URL" ]; if missing
+
+  if [ -z "$EXPOSED_URL" ]; then
     EXPOSED_URL="$(url_from_ip_port "$PUBLIC_IP" "$CUSTOM_NODE_PORT")"
   fi
 
