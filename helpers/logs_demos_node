@@ -10,14 +10,32 @@ UNIT_NAME="${SERVICE_NAME}.service"
 
 # === Determine HTTP endpoint dynamically from .env ===
 ENV_PATH="/opt/demos-node/.env"
+NODE_PORT=53550
+BASE_URL="http://127.0.0.1:$NODE_PORT"
+
 if [ -f "$ENV_PATH" ]; then
-  NODE_PORT=$(grep "^NODE_PORT=" "$ENV_PATH" | cut -d'=' -f2)
-  PUBLIC_IP=$(curl -s ifconfig.me || echo "localhost")
-  HTTP_ENDPOINT="http://$PUBLIC_IP:$NODE_PORT/health"
-else
-  # Fallback if .env not found
-  HTTP_ENDPOINT="http://localhost:53550/health"
+  NODE_PORT=$(grep "^NODE_PORT=" "$ENV_PATH" | cut -d'=' -f2 || echo "53550")
+  EXPOSED_URL=$(grep "^EXPOSED_URL=" "$ENV_PATH" | cut -d'=' -f2 || true)
+  EXPOSED_IP=$(grep "^EXPOSED_IP=" "$ENV_PATH" | cut -d'=' -f2 || true)
+
+  if [ -n "$EXPOSED_URL" ]; then
+    BASE_URL="$EXPOSED_URL"
+    # Append port if missing
+    if [[ "$BASE_URL" != *":$NODE_PORT" ]]; then
+      BASE_URL="${BASE_URL}:$NODE_PORT"
+    fi
+  elif [ -n "$EXPOSED_IP" ]; then
+    if [[ "$EXPOSED_IP" == *:* ]]; then
+      BASE_URL="http://[$EXPOSED_IP]:$NODE_PORT"
+    else
+      BASE_URL="http://$EXPOSED_IP:$NODE_PORT"
+    fi
+  else
+    BASE_URL="http://127.0.0.1:$NODE_PORT"
+  fi
 fi
+
+HTTP_ENDPOINT="${BASE_URL}/health"
 
 # === Systemd & journalctl checks ===
 if ! command -v systemctl &>/dev/null; then
