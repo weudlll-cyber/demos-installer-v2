@@ -26,7 +26,7 @@ fi
 # === Restart the service ===
 echo -e "\e[91m🔧 Restarting service...\e[0m"
 if systemctl restart "$UNIT_NAME"; then
-  echo -e "\e[91m✅ Service restarted successfully.\e[0m"
+  echo -e "\e[91m✅ Service restart command issued.\e[0m"
 else
   echo -e "\e[91m❌ Failed to restart service.\e[0m"
   echo -e "\e[91mTry manually:\e[0m"
@@ -35,12 +35,19 @@ else
 fi
 
 # === Confirm new status ===
+sleep 2
 STATUS=$(systemctl is-active "$UNIT_NAME")
+PID=$(systemctl show -p MainPID "$UNIT_NAME" | cut -d= -f2 || echo 0)
+PID=${PID:-0}
+
 if [ "$STATUS" = "active" ]; then
   echo -e "\e[91m✅ Demos Node is running.\e[0m"
+  echo -e "\e[91m🧬 Main PID after restart: $PID\e[0m"
 else
   echo -e "\e[91m⚠️ Service restarted but is not active. Status: $STATUS\e[0m"
-  echo -e "\e[91mCheck logs:\e[0m"
-  echo -e "\e[91msudo journalctl -u $UNIT_NAME --no-pager --since \"5 minutes ago\"\e[0m"
+  echo -e "\e[91mRecent logs:\e[0m"
+  journalctl -u "$UNIT_NAME" --no-pager -n 20
+  echo -e "\e[91m👉 Check logs above for errors and try:\e[0m"
+  echo -e "\e[91msudo systemctl restart $UNIT_NAME\e[0m"
   exit 1
 fi
