@@ -2,9 +2,8 @@
 set -e
 IFS=$'\n\t'
 
-# Ensure we're using Bash
 if [ -z "$BASH_VERSION" ]; then
-  echo "❌ This script must be run with bash. Try: bash install_helpers_v1.sh"
+  echo "❌ This script must be run with bash. Try: bash install_helpers_minimal.sh"
   exit 1
 fi
 
@@ -12,9 +11,9 @@ HELPER_DIR="/opt/demos-node/helpers"
 GLOBAL_BIN="/usr/local/bin"
 MONITOR_LOG="/var/log/demos_node_monitor.log"
 
-mkdir -p "$HELPER_DIR" "$GLOBAL_BIN" || true
+mkdir -p "$HELPER_DIR" "$GLOBAL_BIN"
 
-# restart helper
+# === restart helper ===
 cat > "$HELPER_DIR/restart_demos_node.sh" <<'EOF'
 #!/bin/bash
 set -e
@@ -26,19 +25,7 @@ systemctl status "$SERVICE" --no-pager -l
 EOF
 chmod 755 "$HELPER_DIR/restart_demos_node.sh"
 
-# backup keys
-cat > "$HELPER_DIR/backup_demos_keys.sh" <<'EOF'
-#!/bin/bash
-set -e
-mkdir -p ~/demos-keys
-cp /opt/demos-node/.demos_identity ~/demos-keys/.demos_identity 2>/dev/null || true
-cp /opt/demos-node/publickey_ed25519_* ~/demos-keys/ 2>/dev/null || true
-chmod 600 ~/demos-keys/.demos_identity 2>/dev/null || true
-ls -l ~/demos-keys || true
-EOF
-chmod 700 "$HELPER_DIR/backup_demos_keys.sh"
-
-# stop helper
+# === stop helper ===
 cat > "$HELPER_DIR/stop_demos_node.sh" <<'EOF'
 #!/bin/bash
 set -e
@@ -57,15 +44,14 @@ echo "✅ Stop sequence complete"
 EOF
 chmod 755 "$HELPER_DIR/stop_demos_node.sh"
 
-# health-check script
+# === check helper ===
 cat > "$HELPER_DIR/check_demos_node.sh" <<'EOF'
 #!/bin/bash
 set -e
 SERVICE="demos-node.service"
 MON_LOG="/var/log/demos_node_monitor.log"
-
-# Load .env for NODE_PORT and EXPOSED_URL
 ENV_FILE="/opt/demos-node/.env"
+
 if [ -f "$ENV_FILE" ]; then
   NODE_PORT=$(grep "^NODE_PORT=" "$ENV_FILE" | cut -d'=' -f2)
   EXPOSED_URL=$(grep "^EXPOSED_URL=" "$ENV_FILE" | cut -d'=' -f2)
@@ -100,7 +86,7 @@ if [ "${ACTION_LOGS:-0}" = "1" ]; then journalctl -u "$SERVICE" -n "$TAIL_LINES"
 if [ "${ACTION_RESTART:-0}" = "1" ]; then log "Manual restart requested"; systemctl restart "$SERVICE"; sleep 2; systemctl is-active --quiet "$SERVICE" && log "Service active after restart" || log "Service not active after restart"; exit 0; fi
 
 HEALTH_OK=0
-if systemctl is-active --quiet "$SERVICE"; then log "systemd reports $SERVICE running"; HEALTH_OK=1; else log "systemd reports $SERVICE NOT running"; HEALTH_OK=0; fi
+if systemctl is-active --quiet "$SERVICE"; then log "systemd reports $SERVICE running"; HEALTH_OK=1; else log "systemd reports $SERVICE NOT running"; fi
 if pgrep -f "/opt/demos-node" >/dev/null 2>&1; then log "Process referencing /opt/demos-node exists"; HEALTH_OK=$((HEALTH_OK+1)); else log "No process referencing /opt/demos-node"; fi
 if command -v curl >/dev/null 2>&1; then
   if curl -sSf --max-time 3 "$HEALTH_URL" >/dev/null 2>&1; then log "HTTP health endpoint OK: $HEALTH_URL"; HEALTH_OK=$((HEALTH_OK+1)); else log "HTTP health endpoint failed or not present: $HEALTH_URL"; fi
@@ -110,16 +96,34 @@ if [ "$HEALTH_OK" -ge 2 ]; then log "Node appears HEALTHY (score=$HEALTH_OK)"; e
 EOF
 chmod 755 "$HELPER_DIR/check_demos_node.sh"
 
-# Symlink helpers to /usr/local/bin
+# === Symlinks ===
 ln -sf "$HELPER_DIR/restart_demos_node.sh" "$GLOBAL_BIN/restart_demos_node"
-ln -sf "$HELPER_DIR/backup_demos_keys.sh" "$GLOBAL_BIN/backup_demos_keys"
 ln -sf "$HELPER_DIR/stop_demos_node.sh" "$GLOBAL_BIN/stop_demos_node"
 ln -sf "$HELPER_DIR/check_demos_node.sh" "$GLOBAL_BIN/check_demos_node"
-chmod 755 "$GLOBAL_BIN/restart_demos_node" "$GLOBAL_BIN/backup_demos_keys" "$GLOBAL_BIN/stop_demos_node" "$GLOBAL_BIN/check_demos_node" || true
+chmod 755 "$GLOBAL_BIN/"*demos_node || true
 
-# Ensure monitor log exists
+# === Monitor log ===
 touch "$MONITOR_LOG" || true
 chown root:root "$MONITOR_LOG" || true
 chmod 644 "$MONITOR_LOG" || true
 
-echo "✅ Helpers installed to $HELPER_DIR and symlinked to $GLOBAL_BIN"
+# === Final verification ===
+echo "🧪 Verifying helper installation..."
+HELPERS=(check_demos_node restart_demos_node stop_demos_node)
+MISSING=()
+for h in "${HELPERS[@]}"; do
+  if command -v "$h" >/dev/null 2>&1; then
+    echo "✅ $h is installed and in PATH."
+  else
+    echo "❌ $h is missing."
+    MISSING+=("$h")
+  fi
+done
+
+if [ "${#MISSING[@]}" -gt 0 ]; then
+  echo "❌ Some helpers failed to install: ${MISSING[*]}"
+  echo "Try re-running this script or manually installing missing helpers."
+  exit 1
+fi
+
+echo "🎉 All selected helpers installed successfully and symlinked to $GLOBAL_BIN"
