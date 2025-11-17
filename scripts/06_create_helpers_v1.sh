@@ -18,9 +18,17 @@ if [ -f "$STEP_MARKER" ]; then
   exit 0
 fi
 
-# === Download and run unified installer ===
+# === Pre-check: ensure installer script exists in GitHub ===
 HELPER_INSTALL_URL="https://raw.githubusercontent.com/weudlll-cyber/demos-installer-v2/main/install_helpers_v1.sh"
+echo -e "\e[91m🔍 Verifying installer script exists in GitHub...\e[0m"
+if ! curl -sI "$HELPER_INSTALL_URL" | grep -q "200 OK"; then
+  echo -e "\e[91m❌ install_helpers_v1.sh not found in repo. Aborting.\e[0m"
+  echo -e "\e[91mMake sure it's committed to:\e[0m"
+  echo -e "\e[91m  $HELPER_INSTALL_URL\e[0m"
+  exit 1
+fi
 
+# === Download and run unified installer ===
 echo -e "\e[91m📥 Downloading unified helper installer...\e[0m"
 curl -fsSL "$HELPER_INSTALL_URL" -o /tmp/install_helpers_v1.sh || {
   echo -e "\e[91m❌ Failed to download install_helpers_v1.sh\e[0m"
