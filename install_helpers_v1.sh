@@ -18,7 +18,7 @@ mkdir -p "$HELPER_DIR" "$GLOBAL_BIN"
 echo "📥 Downloading helper scripts from GitHub..."
 
 for helper in "${HELPERS[@]}"; do
-  src="${REPO_BASE}/${helper}.sh"
+  src="${REPO_BASE}/${helper}"   # no .sh suffix
   dst="${HELPER_DIR}/${helper}.sh"
   tmp="${dst}.tmp.$$"
   bin="${GLOBAL_BIN}/${helper}"
