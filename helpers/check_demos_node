@@ -1,6 +1,6 @@
 #!/bin/bash
-# This helper script performs a detailed health check on the Demos Node systemd service.
-# It explains the current status, PID, and checks the HTTP endpoint using .env configuration.
+# Expanded health check for Demos Node systemd service.
+# Keeps detailed case handling, fixes URL construction, and adds endpoint fallback.
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -19,17 +19,12 @@ if [ -f "$ENV_FILE" ]; then
   EXPOSED_IP=$(grep -m1 "^EXPOSED_IP=" "$ENV_FILE" | cut -d'=' -f2 || true)
 
   if [ -n "$EXPOSED_URL" ]; then
-    # Use provided URL. Ensure scheme present and port appended if missing.
     BASE_URL="$EXPOSED_URL"
-    if [[ "$BASE_URL" != http://* && "$BASE_URL" != https://* ]]; then
-      BASE_URL="http://$BASE_URL"
-    fi
-    # append port if absent
-    if [[ "$BASE_URL" != *":$NODE_PORT" ]]; then
+    [[ "$BASE_URL" =~ ^http ]] || BASE_URL="http://$BASE_URL"
+    if [[ "$BASE_URL" != *":$NODE_PORT"* ]]; then
       BASE_URL="${BASE_URL%/}:$NODE_PORT"
     fi
   elif [ -n "$EXPOSED_IP" ]; then
-    # IP-only: handle IPv6 bracket notation
     if [[ "$EXPOSED_IP" == *:* ]]; then
       BASE_URL="http://[$EXPOSED_IP]:$NODE_PORT"
     else
@@ -40,11 +35,12 @@ if [ -f "$ENV_FILE" ]; then
   fi
 fi
 
-HTTP_ENDPOINT="${BASE_URL%/}/health"
+# Normalize any accidental double colons
+BASE_URL=$(echo "$BASE_URL" | sed -E 's/:+/:/g')
 
 echo -e "\e[91m🔍 Starting full health check for Demos Node service: $SERVICE_NAME\e[0m"
 
-# === Pre-checks: systemctl, journalctl, service existence ===
+# === Pre-checks ===
 if ! command -v systemctl &>/dev/null; then
   echo -e "\e[91m❌ systemctl not found. This system may not support systemd.\e[0m"
   exit 1
@@ -104,14 +100,25 @@ else
   echo -e "\e[91m⚠️ No active process found. The service may be stopped or failed.\e[0m"
 fi
 
-# === HTTP health check ===
-echo -e "\e[91m🌐 Checking HTTP endpoint: $HTTP_ENDPOINT\e[0m"
-if curl -fs --max-time 5 "$HTTP_ENDPOINT" &>/dev/null; then
-  echo -e "\e[91m✅ HTTP endpoint is responsive.\e[0m"
-else
-  echo -e "\e[91m⚠️ HTTP endpoint is not responding.\e[0m"
+# === HTTP endpoint check with fallback ===
+ENDPOINTS=( "/health" "/status" "/metrics" )
+RESPONSIVE=false
+
+for ep in "${ENDPOINTS[@]}"; do
+  HTTP_ENDPOINT="${BASE_URL%/}$ep"
+  echo -e "\e[91m🌐 Checking HTTP endpoint: $HTTP_ENDPOINT\e[0m"
+  if curl -fs --max-time 5 "$HTTP_ENDPOINT" &>/dev/null; then
+    echo -e "\e[91m✅ Endpoint $ep is responsive.\e[0m"
+    RESPONSIVE=true
+    break
+  else
+    echo -e "\e[91m⚠️ Endpoint $ep did not respond.\e[0m"
+  fi
+done
+
+if [ "$RESPONSIVE" = false ]; then
+  echo -e "\e[91m❌ No known endpoint responded.\e[0m"
   echo -e "\e[91mThis may indicate the node is running but not serving traffic.\e[0m"
-  echo -e "\e[91mCheck if the port is correct or if the node exposes a health route.\e[0m"
   echo -e "\e[91mRecent logs:\e[0m"
   journalctl -u "$UNIT_NAME" --no-pager -n 40
 fi
