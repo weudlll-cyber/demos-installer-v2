@@ -11,7 +11,7 @@ fi
 REPO_BASE="https://raw.githubusercontent.com/weudlll-cyber/demos-installer-v2/main/helpers"
 HELPER_DIR="/opt/demos-node/helpers"
 GLOBAL_BIN="/usr/local/bin"
-HELPERS=(check_demos_node restart_demos_node stop_demos_node)
+HELPERS=(check_demos_node restart_demos_node logs_demos_node)
 
 mkdir -p "$HELPER_DIR" "$GLOBAL_BIN"
 
