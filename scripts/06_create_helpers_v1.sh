@@ -6,7 +6,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 echo -e "\e[91m🔧 [06] Installing helper tools for Demos Node management...\e[0m"
-echo -e "\e[91mThese tools make it easier to check status, restart, stop, and back up keys.\e[0m"
+echo -e "\e[91mThese tools make it easier to check status, restart, and view logs.\e[0m"
 
 MARKER_DIR="/root/.demos_node_setup"
 STEP_MARKER="$MARKER_DIR/06_create_helpers.done"
