@@ -176,7 +176,7 @@ fi
 
 # === Helper verification ===
 echo -e "\e[91m🧰 Verifying helper scripts...\e[0m"
-HELPERS=("check_demos_node" "restart_demos_node" "logs_demos_node" "backup_demos_keys" "stop_demos_node")
+HELPERS=("check_demos_node" "restart_demos_node" "logs_demos_node")
 MISSING=()
 
 for helper in "${HELPERS[@]}"; do
