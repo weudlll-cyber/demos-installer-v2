@@ -1,8 +1,9 @@
 #!/bin/bash
-# Expanded health check for Demos Node systemd service.
-# Keeps detailed case handling, fixes URL construction, and adds endpoint fallback.
+# Complete health check for Demos Node systemd service.
+# Expanded case handling, fixes URL construction, adds endpoint fallback.
+# Patched error handling so missing vars or curl failures don't abort the script.
 
-set -euo pipefail
+set -eo pipefail   # drop the "u" so unset vars won't kill the script
 IFS=$'\n\t'
 
 SERVICE_NAME="demos-node"
@@ -15,8 +16,8 @@ BASE_URL="http://127.0.0.1:$NODE_PORT"
 
 if [ -f "$ENV_FILE" ]; then
   NODE_PORT=$(grep -m1 "^NODE_PORT=" "$ENV_FILE" | cut -d'=' -f2 || echo "53550")
-  EXPOSED_URL=$(grep -m1 "^EXPOSED_URL=" "$ENV_FILE" | cut -d'=' -f2 || true)
-  EXPOSED_IP=$(grep -m1 "^EXPOSED_IP=" "$ENV_FILE" | cut -d'=' -f2 || true)
+  EXPOSED_URL=$(grep -m1 "^EXPOSED_URL=" "$ENV_FILE" | cut -d'=' -f2 || echo "")
+  EXPOSED_IP=$(grep -m1 "^EXPOSED_IP=" "$ENV_FILE" | cut -d'=' -f2 || echo "")
 
   if [ -n "$EXPOSED_URL" ]; then
     BASE_URL="$EXPOSED_URL"
@@ -43,12 +44,10 @@ echo -e "\e[91m🔍 Starting full health check for Demos Node service: $SERVICE_
 # === Pre-checks ===
 if ! command -v systemctl &>/dev/null; then
   echo -e "\e[91m❌ systemctl not found. This system may not support systemd.\e[0m"
-  exit 1
 fi
 
 if ! command -v journalctl &>/dev/null; then
   echo -e "\e[91m❌ journalctl not found. Cannot display logs.\e[0m"
-  exit 1
 fi
 
 if ! systemctl show "$UNIT_NAME" &>/dev/null; then
@@ -56,69 +55,68 @@ if ! systemctl show "$UNIT_NAME" &>/dev/null; then
   echo -e "\e[91mMake sure the node was installed and the service was created.\e[0m"
   echo -e "\e[91mTry:\e[0m"
   echo -e "\e[91msudo systemctl daemon-reload && sudo systemctl enable $UNIT_NAME && sudo systemctl start $UNIT_NAME\e[0m"
-  exit 1
-fi
-
-# === Get systemd status and PID ===
-STATUS=$(systemctl is-active "$UNIT_NAME")
-PID=$(systemctl show -p MainPID "$UNIT_NAME" | cut -d= -f2 || echo 0)
-PID=${PID:-0}
-
-echo -e "\e[91m🧠 Systemd Status: $STATUS\e[0m"
-case "$STATUS" in
-  active)
-    echo -e "\e[91m✅ The service is running normally.\e[0m"
-    ;;
-  inactive)
-    echo -e "\e[91m⚠️ The service is installed but not running.\e[0m"
-    echo -e "\e[91mYou can start it with:\e[0m"
-    echo -e "\e[91msudo systemctl start $UNIT_NAME\e[0m"
-    ;;
-  failed)
-    echo -e "\e[91m❌ The service has crashed or failed to start.\e[0m"
-    echo -e "\e[91mRecent logs:\e[0m"
-    journalctl -u "$UNIT_NAME" --no-pager -n 20
-    echo -e "\e[91mYou can try restarting it:\e[0m"
-    echo -e "\e[91msudo systemctl restart $UNIT_NAME\e[0m"
-    ;;
-  activating)
-    echo -e "\e[91m⏳ The service is in the process of starting.\e[0m"
-    ;;
-  deactivating)
-    echo -e "\e[91m⏸️ The service is shutting down.\e[0m"
-    ;;
-  *)
-    echo -e "\e[91m❓ Unknown status: $STATUS\e[0m"
-    ;;
-esac
-
-# === PID check ===
-if [[ "$PID" =~ ^[0-9]+$ ]] && [ "$PID" -gt 0 ]; then
-  echo -e "\e[91m🧬 Main PID: $PID\e[0m"
-  echo -e "\e[91m✅ The process is alive and tracked by systemd.\e[0m"
 else
-  echo -e "\e[91m⚠️ No active process found. The service may be stopped or failed.\e[0m"
-fi
+  # === Get systemd status and PID ===
+  STATUS=$(systemctl is-active "$UNIT_NAME" || echo "unknown")
+  PID=$(systemctl show -p MainPID "$UNIT_NAME" | cut -d= -f2 || echo 0)
+  PID=${PID:-0}
 
-# === HTTP endpoint check with fallback ===
-ENDPOINTS=( "/health" "/status" "/metrics" )
-RESPONSIVE=false
+  echo -e "\e[91m🧠 Systemd Status: $STATUS\e[0m"
+  case "$STATUS" in
+    active)
+      echo -e "\e[91m✅ The service is running normally.\e[0m"
+      ;;
+    inactive)
+      echo -e "\e[91m⚠️ The service is installed but not running.\e[0m"
+      echo -e "\e[91mYou can start it with:\e[0m"
+      echo -e "\e[91msudo systemctl start $UNIT_NAME\e[0m"
+      ;;
+    failed)
+      echo -e "\e[91m❌ The service has crashed or failed to start.\e[0m"
+      echo -e "\e[91mRecent logs:\e[0m"
+      journalctl -u "$UNIT_NAME" --no-pager -n 20
+      echo -e "\e[91mYou can try restarting it:\e[0m"
+      echo -e "\e[91msudo systemctl restart $UNIT_NAME\e[0m"
+      ;;
+    activating)
+      echo -e "\e[91m⏳ The service is in the process of starting.\e[0m"
+      ;;
+    deactivating)
+      echo -e "\e[91m⏸️ The service is shutting down.\e[0m"
+      ;;
+    *)
+      echo -e "\e[91m❓ Unknown status: $STATUS\e[0m"
+      ;;
+  esac
 
-for ep in "${ENDPOINTS[@]}"; do
-  HTTP_ENDPOINT="${BASE_URL%/}$ep"
-  echo -e "\e[91m🌐 Checking HTTP endpoint: $HTTP_ENDPOINT\e[0m"
-  if curl -fs --max-time 5 "$HTTP_ENDPOINT" &>/dev/null; then
-    echo -e "\e[91m✅ Endpoint $ep is responsive.\e[0m"
-    RESPONSIVE=true
-    break
+  # === PID check ===
+  if [[ "$PID" =~ ^[0-9]+$ ]] && [ "$PID" -gt 0 ]; then
+    echo -e "\e[91m🧬 Main PID: $PID\e[0m"
+    echo -e "\e[91m✅ The process is alive and tracked by systemd.\e[0m"
   else
-    echo -e "\e[91m⚠️ Endpoint $ep did not respond.\e[0m"
+    echo -e "\e[91m⚠️ No active process found. The service may be stopped or failed.\e[0m"
   fi
-done
 
-if [ "$RESPONSIVE" = false ]; then
-  echo -e "\e[91m❌ No known endpoint responded.\e[0m"
-  echo -e "\e[91mThis may indicate the node is running but not serving traffic.\e[0m"
-  echo -e "\e[91mRecent logs:\e[0m"
-  journalctl -u "$UNIT_NAME" --no-pager -n 40
+  # === HTTP endpoint check with fallback ===
+  ENDPOINTS=( "/health" "/status" "/metrics" )
+  RESPONSIVE=false
+
+  for ep in "${ENDPOINTS[@]}"; do
+    HTTP_ENDPOINT="${BASE_URL%/}$ep"
+    echo -e "\e[91m🌐 Checking HTTP endpoint: $HTTP_ENDPOINT\e[0m"
+    if curl -fs --max-time 5 "$HTTP_ENDPOINT" &>/dev/null; then
+      echo -e "\e[91m✅ Endpoint $ep is responsive.\e[0m"
+      RESPONSIVE=true
+      break
+    else
+      echo -e "\e[91m⚠️ Endpoint $ep did not respond.\e[0m"
+    fi
+  done
+
+  if [ "$RESPONSIVE" = false ]; then
+    echo -e "\e[91m❌ No known endpoint responded.\e[0m"
+    echo -e "\e[91mThis may indicate the node is running but not serving traffic.\e[0m"
+    echo -e "\e[91mRecent logs:\e[0m"
+    journalctl -u "$UNIT_NAME" --no-pager -n 40
+  fi
 fi
