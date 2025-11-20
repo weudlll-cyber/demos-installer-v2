@@ -69,6 +69,18 @@ kill_port_if_listening() {
   ss -tuln | grep -q ":$port[[:space:]]" && return 1 || return 0
 }
 
+port_bound_addresses() {
+  local port="$1"
+  # print unique local addresses bound to port (e.g., 127.0.0.1, 0.0.0.0, :::)
+  ss -tuln | awk -v p=":$port" '$0 ~ p {print $5}' | sed -E 's/:[0-9]+$//' | sort -u || true
+}
+
+http_probe() {
+  local url="$1"
+  curl -fsS --max-time 5 "$url" >/dev/null 2>&1
+  return $?
+}
+
 # === Configure .env in /opt/demos-node ===
 echo -e "\e[91m🔧 Generating .env configuration...\e[0m"
 if [ ! -f "$ENV_PATH" ]; then
@@ -172,6 +184,51 @@ else
   echo -e "\e[91m❌ Service not active.\e[0m"
   sudo journalctl -u demos-node --no-pager --since "5 minutes ago" || true
   exit 1
+fi
+
+# === Ensure node is reachable on public IP ===
+echo -e "\e[91m🔍 Checking service bindings on port $CUSTOM_NODE_PORT...\e[0m"
+BOUND_ADDRS=$(port_bound_addresses "$CUSTOM_NODE_PORT" | tr '\n' ' ')
+
+echo -e "\e[91mℹ️ Bound addresses: $BOUND_ADDRS\e[0m"
+
+if echo "$BOUND_ADDRS" | grep -q "127.0.0.1"; then
+  echo -e "\e[91m⚠️ Node appears to be bound to localhost only. Will attempt to set BIND_ADDRESS=0.0.0.0 in $ENV_PATH and restart.\e[0m"
+  # Set BIND_ADDRESS to 0.0.0.0 so service listens on all interfaces (if the app respects this env)
+  safe_set_env "BIND_ADDRESS" "0.0.0.0"
+  echo -e "\e[91m🔄 Restarting demos-node to apply bind change...\e[0m"
+  systemctl restart demos-node || true
+  sleep 2
+  BOUND_ADDRS=$(port_bound_addresses "$CUSTOM_NODE_PORT" | tr '\n' ' ')
+  echo -e "\e[91mℹ️ New bound addresses: $BOUND_ADDRS\e[0m"
+fi
+
+# === Probe endpoints on public IP ===
+HEALTH_URL="$(url_from_ip_port "$PUBLIC_IP" "$CUSTOM_NODE_PORT")/health"
+STATUS_URL="$(url_from_ip_port "$PUBLIC_IP" "$CUSTOM_NODE_PORT")/status"
+METRICS_URL="$(url_from_ip_port "$PUBLIC_IP" "$CUSTOM_NODE_PORT")/metrics"
+
+echo -e "\e[91m🌐 Checking HTTP endpoint: $HEALTH_URL\e[0m"
+if http_probe "$HEALTH_URL"; then
+  echo -e "\e[91m✅ /health responded.\e[0m"
+else
+  echo -e "\e[91m⚠️ Endpoint /health did not respond. Trying /status and /metrics...\e[0m"
+  if http_probe "$STATUS_URL"; then
+    echo -e "\e[91m✅ /status responded.\e[0m"
+  elif http_probe "$METRICS_URL"; then
+    echo -e "\e[91m✅ /metrics responded.\e[0m"
+  else
+    echo -e "\e[91m❌ No known endpoint on public IP responded.\e[0m"
+    # If bound only to localhost, explain and advise
+    if echo "$BOUND_ADDRS" | grep -q "127.0.0.1"; then
+      echo -e "\e[91m⚠️ Service is still bound to localhost only. The node may be functional locally but not reachable externally.\e[0m"
+      echo -e "\e[91mCheck if the application reads BIND_ADDRESS from .env or uses a different config key. If it uses a different key, set it in $ENV_PATH and restart.\e[0m"
+    fi
+    echo -e "\e[91mRecent logs (last 50 lines):\e[0m"
+    sudo journalctl -u demos-node --no-pager -n 50 || true
+    echo -e "\e[91mIf you expect the node to serve on the public interface, confirm the app binds to 0.0.0.0 or the public IP and re-run this step.\e[0m"
+    # continue rather than hard-fail — installer should still mark complete but warn
+  fi
 fi
 
 # === Helper verification ===
