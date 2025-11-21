@@ -26,19 +26,20 @@ fi
 touch "$LOCK_FILE"
 trap 'rm -f "$LOCK_FILE"' EXIT
 
-# === Version Map ===
-declare -A VERSION_MAP=(
-  [01]="01_prepare_system_v1.sh"
-  [02]="02_install_docker_v1.sh"
-  [03]="03_install_bun_v1.sh"
-  [04]="04_clone_node_v1.sh"
-  [05]="05_setup_service_v1.sh"
-  [06]="06_create_helpers_v1.sh"
-  [07]="07_finalize_v1.sh"
-)
-
 # === Script Source URL ===
 SCRIPT_BASE_URL="https://raw.githubusercontent.com/weudlll-cyber/demos-installer-v2/main/scripts"
+
+# === Steps (including split finalization) ===
+STEPS=(
+  "01_prepare_system_v1.sh"
+  "02_install_docker_v1.sh"
+  "03_install_bun_v1.sh"
+  "04_clone_node_v1.sh"
+  "05_setup_service_v1.sh"
+  "06_create_helpers_v1.sh"
+  "07a_finalize_v1.sh"
+  "07b_finalize_v1.sh"
+)
 
 # === Function: Fetch or Update Script ===
 fetch_or_update_script() {
@@ -74,19 +75,21 @@ fetch_or_update_script() {
 }
 
 # === Run Each Step ===
-for STEP in {01..07}; do
-  SCRIPT="${VERSION_MAP[$STEP]}"
+for SCRIPT in "${STEPS[@]}"; do
+  # Derive step label (e.g., 01, 07a, 07b) for messages
+  STEP_LABEL="${SCRIPT%%_*}"
+
   fetch_or_update_script "$SCRIPT"
 
-  echo -e "\e[91m🔧 Running step $STEP: $SCRIPT\e[0m"
+  echo -e "\e[91m🔧 Running step $STEP_LABEL: $SCRIPT\e[0m"
   if ! bash "$SCRIPT"; then
-    echo -e "\e[91m❌ Step $STEP failed: $SCRIPT\e[0m"
+    echo -e "\e[91m❌ Step $STEP_LABEL failed: $SCRIPT\e[0m"
     echo -e "\e[91mFix the issue above, then restart:\e[0m"
     echo -e "\e[91msudo bash demos_node_setup_v1.sh\e[0m"
     exit 1
   fi
 
-  echo -e "\e[91m✅ Step $STEP completed successfully.\e[0m"
+  echo -e "\e[91m✅ Step $STEP_LABEL completed successfully.\e[0m"
 done
 
 # === Done ===
