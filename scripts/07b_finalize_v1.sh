@@ -1,5 +1,6 @@
 #!/bin/bash
-# Step 07b: Configure peerlist, back up keys, ensure public binding, probe endpoints, verify helpers, smoke tests
+# Step 07b: Configure peerlist, back up keys, ensure public binding,
+# unmask/start node, probe endpoints, verify helpers, smoke tests
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -7,10 +8,13 @@ IFS=$'\n\t'
 echo -e "\e[91m🧩 [07b] Finalizing peerlist, backups, and health...\e[0m"
 
 MARKER_DIR="/root/.demos_node_setup"
-STEP_MARKER="$MARKER_DIR/07b_finalize_peerlist_health.done"
+STEP_MARKER="$MARKER_DIR/07b_finalize_v1.done"
 mkdir -p "$MARKER_DIR"
 
-[ -f "$STEP_MARKER" ] && { echo -e "\e[91m✅ [07b] Already completed. Skipping.\e[0m"; exit 0; }
+if [ -f "$STEP_MARKER" ]; then
+  echo -e "\e[91m✅ [07b] Already completed. Skipping.\e[0m"
+  exit 0
+fi
 
 # Defaults
 ENV_PATH="/opt/demos-node/.env"
@@ -68,7 +72,6 @@ if [ -n "$PUBKEY_FILE" ]; then
   PUBKEY_HEX="${PUBKEY_FILE#publickey_ed25519_}"
   echo "{ \"0x$PUBKEY_HEX\": \"$EXPOSED_URL\" }" > "$PEERLIST_PATH"
   echo -e "\e[91m✅ Peerlist set for 0x$PUBKEY_HEX -> $EXPOSED_URL\e[0m"
-  systemctl restart demos-node || true
 else
   echo -e "\e[91m⚠️ No public key found. Skipping peerlist.\e[0m"
 fi
@@ -80,6 +83,11 @@ mkdir -p "$BACKUP_DIR"
 cp /opt/demos-node/.demos_identity "$BACKUP_DIR/" 2>/dev/null || echo -e "\e[91m⚠️ No .demos_identity file.\e[0m"
 cp /opt/demos-node/publickey_ed25519_* "$BACKUP_DIR/" 2>/dev/null || echo -e "\e[91m⚠️ No public key files.\e[0m"
 echo -e "\e[91m✅ Keys backed up to: $BACKUP_DIR\e[0m"
+
+# Unmask and start node service
+echo -e "\e[91m🔁 Unmasking and starting demos-node service...\e[0m"
+sudo systemctl unmask demos-node >/dev/null 2>&1 || true
+sudo systemctl restart demos-node || true
 
 # Service health
 echo -e "\e[91m🔎 Service health...\e[0m"
@@ -144,4 +152,4 @@ check_demos_node --status || true
 logs_demos_node --health || true
 
 touch "$STEP_MARKER"
-echo -e "\e[91m✅ [07b] Peerlist, backups, and health finalized.\e[0m"
+echo -e "\e[91m✅ [07b] Peerlist, backups, and health finalized. Node unmasked and running.\e[0m"
