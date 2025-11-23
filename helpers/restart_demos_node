@@ -1,21 +1,24 @@
 #!/bin/bash
-# restart_demos_node - stop system postgres unit first, stop node, ensure ports free,
-# start node, verify health, then restore postgres unit if it was running before.
+# restart_demos_node
+# - Temporarily disable/unmask systemd supervision for demos-node (so systemd won't immediately re-start on stop)
+# - Stop the node if running
+# - Verify NODE_PORT and DB_PORT are free (optionally --force to kill holders)
+# - Start the node unit and wait for health
+# - Restore systemd enable/daemon state so systemd resumes supervision
 set -euo pipefail
 IFS=$'\n\t'
 
-SERVICE_NAME="demos-node"
-UNIT_NAME="${SERVICE_NAME}.service"
+SERVICE="demos-node"
+UNIT="${SERVICE}.service"
 ENV_FILE="/opt/demos-node/.env"
 
 NODE_PORT=53550
 DB_PORT=5332
 FORCE=false
-RETRY_COUNT=2
+RETRY=3
 SLEEP_BETWEEN=2
-HEALTH_CHECK_TIMEOUT=20
-HEALTH_CHECK_INTERVAL=2
-POSTGRES_CANDIDATES=("postgresql" "postgresql.service")
+HEALTH_TIMEOUT=20
+HEALTH_INTERVAL=2
 
 for arg in "$@"; do
   case "$arg" in
@@ -24,7 +27,8 @@ for arg in "$@"; do
   esac
 done
 
-log() { printf "\e[91m%s\e[0m\n" "$*"; }
+log(){ printf "\e[92m%s\e[0m\n" "$*"; }
+err(){ printf "\e[91m%s\e[0m\n" "$*"; }
 
 # load env overrides
 if [ -f "$ENV_FILE" ]; then
@@ -32,201 +36,165 @@ if [ -f "$ENV_FILE" ]; then
   DB_PORT=$(grep -m1 "^DB_PORT=" "$ENV_FILE" | cut -d'=' -f2 || echo "$DB_PORT")
 fi
 
-ensure_systemd() {
+ensure_systemd(){
   if ! command -v systemctl >/dev/null 2>&1; then
-    log "❌ systemctl not found; this host may not use systemd."
+    err "systemctl not available; aborting"
     exit 1
   fi
 }
 
-detect_postgres_unit() {
-  for u in "${POSTGRES_CANDIDATES[@]}"; do
-    if systemctl list-unit-files --type=service --all | grep -q "^${u}"; then
-      echo "$u"
-      return 0
-    fi
-  done
-  return 1
-}
+is_listening(){ ss -tuln | grep -q ":${1} " && return 0 || return 1; }
 
-is_port_listening() {
-  ss -tuln | grep -q ":${1} " && return 0 || return 1
-}
-
-stop_postgres_if_running() {
-  POSTGRES_UNIT="$(detect_postgres_unit || true)"
-  POSTGRES_WAS_ACTIVE=0
-  if [ -n "${POSTGRES_UNIT}" ]; then
-    if systemctl is-active --quiet "${POSTGRES_UNIT}"; then
-      POSTGRES_WAS_ACTIVE=1
-      log "⏸ Stopping system postgres unit ${POSTGRES_UNIT} to avoid auto-restart on shutdown."
-      sudo systemctl stop "${POSTGRES_UNIT}" >/dev/null 2>&1 || true
-      sleep 1
-    fi
-  fi
-
-  # if DB port still in use, handle per FORCE
-  if is_port_listening "${DB_PORT}"; then
-    log "⚠ DB port ${DB_PORT} still in use after stopping postgres unit."
-    if [ "${FORCE}" = true ]; then
-      log "💀 Force: killing processes bound to ${DB_PORT}"
-      sudo lsof -ti :"${DB_PORT}" | xargs -r sudo kill -9 || true
-      sleep 1
-    else
-      return 1
-    fi
-  fi
-  return 0
-}
-
-restore_postgres_if_needed() {
-  if [ "${POSTGRES_WAS_ACTIVE:-0}" -eq 1 ] && [ -n "${POSTGRES_UNIT:-}" ]; then
-    log "🔁 Restoring postgres unit ${POSTGRES_UNIT} (was active before)."
-    sudo systemctl enable --now "${POSTGRES_UNIT}" >/dev/null 2>&1 || true
-  fi
-}
-
-stop_node_unit() {
-  if systemctl is-active --quiet "${UNIT_NAME}"; then
-    log "🛑 Stopping ${UNIT_NAME}."
-    sudo systemctl stop "${UNIT_NAME}" || true
-    sleep 1
-  else
-    log "ℹ ${UNIT_NAME} not active; nothing to stop."
-  fi
-}
-
-start_node_unit() {
-  log "▶ Starting ${UNIT_NAME}."
-  sudo systemctl start "${UNIT_NAME}" || return 1
-  sleep 1
-  return 0
-}
-
-wait_for_node_active() {
-  local waited=0
-  while [ $waited -lt "${HEALTH_CHECK_TIMEOUT}" ]; do
-    if systemctl is-active --quiet "${UNIT_NAME}"; then
-      return 0
-    fi
-    sleep "${HEALTH_CHECK_INTERVAL}"
-    waited=$((waited + HEALTH_CHECK_INTERVAL))
-  done
-  return 1
-}
-
-node_tcp_healthy() {
-  if command -v timeout >/dev/null 2>&1 && command -v nc >/dev/null 2>&1; then
-    timeout 3 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/${NODE_PORT}" >/dev/null 2>&1 && return 0
+kill_holders(){
+  local port=$1
+  if ! command -v lsof >/dev/null 2>&1; then
+    err "lsof missing; cannot inspect port ${port}"
     return 1
+  fi
+  local pids
+  pids=$(sudo lsof -ti :"${port}" 2>/dev/null || true)
+  if [ -z "$pids" ]; then return 0; fi
+  err "Port ${port} held by PID(s): ${pids}"
+  if [ "$FORCE" = true ]; then
+    err "Killing ${pids}"
+    echo "$pids" | xargs -r sudo kill -9 || true
+    sleep 1
+    return 0
+  fi
+  return 1
+}
+
+wait_for_unit_active(){
+  local unit=$1
+  local waited=0
+  while [ $waited -lt "$HEALTH_TIMEOUT" ]; do
+    if systemctl is-active --quiet "$unit"; then return 0; fi
+    sleep "$HEALTH_INTERVAL"
+    waited=$((waited + HEALTH_INTERVAL))
+  done
+  return 1
+}
+
+tcp_probe(){
+  local port=$1
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 3 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/${port}" >/dev/null 2>&1 && return 0 || return 1
   else
-    is_port_listening "${NODE_PORT}" && return 0 || return 1
+    is_listening "$port" && return 0 || return 1
   fi
 }
 
-# main
+# MAIN
 ensure_systemd
 
-if ! systemctl list-unit-files --type=service --all | grep -q "^${UNIT_NAME}"; then
-  log "❌ Unit ${UNIT_NAME} not found; aborting."
+if ! systemctl list-unit-files --type=service --all | grep -q "^${UNIT}"; then
+  err "Unit ${UNIT} not present; aborting"
   exit 1
 fi
 
-log "🔄 Beginning safe restart: stop systemd-managed postgres first, then stop node."
+log "1) Temporarily preventing systemd from auto-restarting ${UNIT}"
+# mask prevents systemd from attempting to restart on stop; record previous enable state
+PRE_ENABLED=0
+if systemctl is-enabled --quiet "${UNIT}" 2>/dev/null; then PRE_ENABLED=1; fi
+# ensure the unit is masked so systemd doesn't auto-restart while we operate
+sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
+sudo systemctl daemon-reload >/dev/null 2>&1 || true
 
-# 1) Stop system postgres so it won't auto-restart when node stops
-if ! stop_postgres_if_running; then
-  log "⚠ DB port ${DB_PORT} busy and not freed. Rerun with --force or free manually."
-  exit 1
-fi
-log "✅ Postgres handled. DB port ${DB_PORT} free or managed."
-
-# 2) Stop the node unit (systemd) while postgres is stopped
-stop_node_unit
-
-# 3) Ensure node port and DB port are not bound before starting node
-if is_port_listening "${NODE_PORT}"; then
-  log "⚠ Node port ${NODE_PORT} still in use."
-  if [ "${FORCE}" = true ]; then
-    log "💀 Force: killing processes bound to ${NODE_PORT}"
-    sudo lsof -ti :"${NODE_PORT}" | xargs -r sudo kill -9 || true
-    sleep 1
-  else
-    log "✋ Aborting: node port in use. Rerun with --force to kill holders."
-    restore_postgres_if_needed
-    exit 1
-  fi
-fi
-
-if is_port_listening "${DB_PORT}"; then
-  log "⚠ DB port ${DB_PORT} still in use after earlier handling."
-  if [ "${FORCE}" = true ]; then
-    log "💀 Force: killing processes bound to ${DB_PORT}"
-    sudo lsof -ti :"${DB_PORT}" | xargs -r sudo kill -9 || true
-    sleep 1
-  else
-    log "✋ Aborting: DB port still in use. Rerun with --force or free it manually."
-    restore_postgres_if_needed
-    exit 1
-  fi
-fi
-
-# 4) Start node unit and verify
-attempt=0
-started_ok=0
-while [ $attempt -lt $RETRY_COUNT ]; do
-  attempt=$((attempt+1))
-  log "🔁 Start attempt ${attempt}/${RETRY_COUNT}."
-  if start_node_unit; then
-    if wait_for_node_active; then
-      log "✅ systemd reports node unit active. Performing quick TCP check."
-      if node_tcp_healthy; then
-        log "✅ Node TCP port ${NODE_PORT} responsive."
-        started_ok=1
-        break
-      else
-        log "⚠ Node TCP port ${NODE_PORT} not responsive yet."
-      fi
-    else
-      log "⚠ Node unit did not become active within timeout."
-    fi
-  else
-    log "❌ Failed to start node unit (systemd start failed)."
-  fi
-  sleep "${SLEEP_BETWEEN}"
-done
-
-if [ "${started_ok}" -eq 1 ]; then
-  log "✅ Node started and passed basic health checks. Restoring system postgres if it was running before."
-  restore_postgres_if_needed
-  log "🎉 Restart complete."
-  exit 0
-fi
-
-# 5) Fallback: aggressive cleanup if requested, then try one final start
-log "🔧 Node did not become healthy. Performing fallback cleanup."
-sudo systemctl stop "${UNIT_NAME}" >/dev/null 2>&1 || true
-sleep 1
-
-if [ "${FORCE}" = true ]; then
-  log "💀 Force: killing lingering node processes and freeing ports."
-  pgrep -f "/opt/demos-node" | xargs -r sudo kill -9 || true
-  sudo lsof -ti :"${NODE_PORT}" | xargs -r sudo kill -9 || true
-  sudo lsof -ti :"${DB_PORT}" | xargs -r sudo kill -9 || true
+log "2) Stop the node unit if active"
+if systemctl is-active --quiet "${UNIT}"; then
+  sudo systemctl stop "${UNIT}" || true
   sleep 1
+  log "Stopped ${UNIT}"
+else
+  log "${UNIT} not active"
 fi
 
-log "▶ Final start attempt..."
-if start_node_unit && wait_for_node_active && node_tcp_healthy; then
-  log "✅ Node started after fallback. Restoring postgres if needed."
-  restore_postgres_if_needed
-  exit 0
+log "3) Ensure NODE_PORT=${NODE_PORT} is free"
+if is_listening "${NODE_PORT}"; then
+  err "Node port ${NODE_PORT} still in use"
+  if [ "$FORCE" = true ]; then
+    kill_holders "${NODE_PORT}" || { err "Could not kill node port holders"; sudo systemctl unmask "${UNIT}" >/dev/null 2>&1 || true; exit 1; }
+    log "Node port freed via --force"
+  else
+    err "Rerun with --force to kill holders or free manually"
+    sudo systemctl unmask "${UNIT}" >/dev/null 2>&1 || true
+    exit 1
+  fi
+else
+  log "Node port free"
 fi
 
-log "❌ Failed to bring node healthy. Showing recent logs:"
-journalctl -u "${UNIT_NAME}" --no-pager -n 160 || true
+log "4) Ensure DB_PORT=${DB_PORT} is free"
+# try to stop system postgres service first (if present) so it doesn't re-bind when we stop node
+if systemctl list-unit-files --type=service --all | grep -q '^postgresql'; then
+  if systemctl is-active --quiet postgresql; then
+    log "Stopping system postgresql to avoid it binding DB_PORT during node restart"
+    sudo systemctl stop postgresql >/dev/null 2>&1 || true
+    sleep 1
+  fi
+fi
 
-# ensure postgres is restored to avoid leaving system DB down
-restore_postgres_if_needed
+if is_listening "${DB_PORT}"; then
+  err "DB port ${DB_PORT} still in use"
+  if [ "$FORCE" = true ]; then
+    kill_holders "${DB_PORT}" || { err "Could not kill DB port holders"; sudo systemctl unmask "${UNIT}" >/dev/null 2>&1 || true; exit 1; }
+    log "DB port freed via --force"
+  else
+    err "Rerun with --force to kill holders or free manually"
+    sudo systemctl unmask "${UNIT}" >/dev/null 2>&1 || true
+    exit 1
+  fi
+else
+  log "DB port free"
+fi
 
-exit 1
+log "5) Start the node unit (systemd will be unmasked to allow start)"
+# unmask to allow start, but keep disabled state (we will restore enablement later)
+sudo systemctl unmask "${UNIT}" >/dev/null 2>&1 || true
+sudo systemctl daemon-reload >/dev/null 2>&1 || true
+sudo systemctl start "${UNIT}" || { err "systemd start failed"; sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true; exit 1; }
+
+# wait for active and tcp
+if ! wait_for_unit_active "${UNIT}"; then
+  err "${UNIT} did not become active within timeout"
+  # try to capture logs, restore mask state and exit
+  journalctl -u "${UNIT}" --no-pager -n 120 || true
+  # re-mask to return to pre-op state
+  sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
+  # restore postgres if we stopped it earlier
+  if systemctl list-unit-files --type=service --all | grep -q '^postgresql'; then
+    sudo systemctl enable --now postgresql >/dev/null 2>&1 || true
+  fi
+  exit 1
+fi
+
+# quick TCP probe
+if ! tcp_probe "${NODE_PORT}"; then
+  err "Node not responding on TCP port ${NODE_PORT} after start"
+  journalctl -u "${UNIT}" --no-pager -n 120 || true
+  sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
+  if systemctl list-unit-files --type=service --all | grep -q '^postgresql'; then
+    sudo systemctl enable --now postgresql >/dev/null 2>&1 || true
+  fi
+  exit 1
+fi
+
+log "Node started and responsive on ${NODE_PORT}"
+
+log "6) Restore systemd supervision as it was before the operation"
+if [ "${PRE_ENABLED}" -eq 1 ]; then
+  log "Re-enabling and ensuring ${UNIT} is active under systemd"
+  sudo systemctl enable --now "${UNIT}" >/dev/null 2>&1 || true
+else
+  log "Leaving ${UNIT} disabled but unmasked (systemd won't auto-start unless enabled)"
+  # ensure the unit is enabled state remains disabled, but unmasked
+  sudo systemctl disable "${UNIT}" >/dev/null 2>&1 || true
+fi
+
+# Finally, re-enable system postgres if we stopped it earlier (best-effort)
+if systemctl list-unit-files --type=service --all | grep -q '^postgresql'; then
+  sudo systemctl enable --now postgresql >/dev/null 2>&1 || true
+fi
+
+log "Restart procedure complete"
+exit 0
