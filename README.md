@@ -26,7 +26,7 @@ curl -fsSL https://raw.githubusercontent.com/weudlll-cyber/demos-installer-v2/ma
 
 Update the Helper Tools
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/weudlll-cyber/demos-installer-v2/main/scripts/update_helpers_v1.sh" -o /tmp/update_helpers_v1.sh && chmod +x /tmp/update_helpers_v1.sh && sudo /tmp/update_helpers_v1.sh | bash
+curl -fsSL "https://raw.githubusercontent.com/weudlll-cyber/demos-installer-v2/main/update_helpers_v1.sh" -o /tmp/update_helpers_v1.sh && chmod +x /tmp/update_helpers_v1.sh && sudo /tmp/update_helpers_v1.sh | bash
 ```
 
 
