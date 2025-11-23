@@ -1,9 +1,9 @@
 #!/bin/bash
-# restart_demos_node (simplified, safe)
-# - Stop DB container (prefer docker compose stop when available) without persisting state
-# - Disable container restart before stopping to reduce race
-# - Start DB (compose or container), wait for DB to be reachable
-# - Start demos-node systemd unit only after DB is reachable
+# restart_demos_node (patched)
+# - Prefer docker-compose stop/start when available
+# - Normalize EXPOSED_URL/EXPOSED_IP from .env
+# - Wait for DB to be reachable
+# - Start demos-node only after HTTP /health probe succeeds (tries loopback + exposed)
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -14,8 +14,10 @@ ENV_FILE="/opt/demos-node/.env"
 NODE_PORT=53550
 DB_PORT=5332
 FORCE=false
-HEALTH_TIMEOUT=30
-HEALTH_INTERVAL=2
+HEALTH_TIMEOUT=90   # overall wait for readiness
+DB_TIMEOUT=30
+DB_POLL_INTERVAL=1
+HTTP_POLL_INTERVAL=1
 
 for arg in "$@"; do
   case "$arg" in
@@ -27,78 +29,51 @@ done
 log(){ printf "\e[92m%s\e[0m\n" "$*"; }
 err(){ printf "\e[91m%s\e[0m\n" "$*" >&2; }
 
-# load env overrides
+_trim_trailing() {
+  local s="$1"
+  s="${s%/}"
+  s="${s%:}"
+  s="$(printf "%s" "$s" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  printf '%s' "$s"
+}
+
+# load env overrides and normalize exposed URL/IP
+BASE_URL="http://127.0.0.1:$NODE_PORT"
 if [ -f "$ENV_FILE" ]; then
   NODE_PORT=$(grep -m1 "^NODE_PORT=" "$ENV_FILE" | cut -d'=' -f2 || echo "$NODE_PORT")
-  DB_PORT=$(grep -m1 "^DB_PORT=" "$ENV_FILE" | cut -d'=' -f2 || echo "$DB_PORT")
+  NODE_PORT=${NODE_PORT:-$NODE_PORT}
+  EXPOSED_URL=$(grep -m1 "^EXPOSED_URL=" "$ENV_FILE" | cut -d'=' -f2 || true)
+  EXPOSED_IP=$(grep -m1 "^EXPOSED_IP=" "$ENV_FILE" | cut -d'=' -f2 || true)
+  EXPOSED_URL=${EXPOSED_URL:-}
+  EXPOSED_IP=${EXPOSED_IP:-}
+
+  if [ -n "$EXPOSED_URL" ]; then
+    if [[ "$EXPOSED_URL" != http://* && "$EXPOSED_URL" != https://* ]]; then
+      EXPOSED_URL="http://$EXPOSED_URL"
+    fi
+    base="$(_trim_trailing "$EXPOSED_URL")"
+    hostport="${base#http://}"
+    hostport="${hostport#https://}"
+    if [[ "$hostport" =~ :[0-9]+$ ]]; then
+      BASE_URL="$base"
+    else
+      BASE_URL="${base}:$NODE_PORT"
+    fi
+  elif [ -n "$EXPOSED_IP" ]; then
+    ip="$(_trim_trailing "$EXPOSED_IP")"
+    if [[ "$ip" == *:* ]]; then
+      BASE_URL="http://[$ip]:$NODE_PORT"
+    else
+      BASE_URL="http://$ip:$NODE_PORT"
+    fi
+  else
+    BASE_URL="http://127.0.0.1:$NODE_PORT"
+  fi
 fi
+BASE_URL="${BASE_URL%/}"
+HTTP_ENDPOINT="${BASE_URL}/health"
 
-is_listening(){ ss -tuln | grep -q ":${1} " && return 0 || return 1; }
-
-wait_for_unit_active(){
-  unit=$1
-  waited=0
-  while [ $waited -lt "$HEALTH_TIMEOUT" ]; do
-    if systemctl is-active --quiet "$unit"; then return 0; fi
-    sleep "$HEALTH_INTERVAL"
-    waited=$((waited + HEALTH_INTERVAL))
-  done
-  return 1
-}
-
-tcp_probe_once(){
-  port=$1
-  bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/${port}" >/dev/null 2>&1 && return 0 || return 1
-}
-
-detect_docker_container_publishing_port(){
-  port=$1
-  if ! command -v docker >/dev/null 2>&1; then
-    echo ""
-    return 0
-  fi
-  docker ps --format '{{.ID}}\t{{.Names}}\t{{.Ports}}' | awk -v p=":${port}->" '$0 ~ p { print $1; exit }'
-}
-
-wait_for_db(){
-  timeout=$HEALTH_TIMEOUT
-  elapsed=0
-  interval=1
-
-  # if docker present and container publishing port exists, prefer checking Docker health
-  if command -v docker >/dev/null 2>&1; then
-    cid=$(docker ps --format '{{.ID}}\t{{.Ports}}' | awk -v p=":${DB_PORT}->" '$0 ~ p { print $1; exit }' || true)
-    if [ -n "$cid" ]; then
-      # docker health check if present
-      if docker inspect -f '{{.State.Health.Status}}' "$cid" >/dev/null 2>&1; then
-        while [ $elapsed -lt $timeout ]; do
-          state=$(docker inspect -f '{{.State.Health.Status}}' "$cid" 2>/dev/null || echo "")
-          if [ "$state" = "healthy" ]; then
-            log "DB container ${cid} reports healthy"
-            return 0
-          fi
-          sleep $interval
-          elapsed=$((elapsed + interval))
-        done
-      fi
-    fi
-  fi
-
-  # fallback to TCP probe on localhost
-  elapsed=0
-  while [ $elapsed -lt $timeout ]; do
-    if tcp_probe_once "$DB_PORT"; then
-      log "DB listening on 127.0.0.1:${DB_PORT}"
-      return 0
-    fi
-    sleep $interval
-    elapsed=$((elapsed + interval))
-  done
-
-  err "DB did not become reachable on 127.0.0.1:${DB_PORT} within ${timeout}s"
-  return 1
-}
-
+# helpers
 ensure_systemd(){
   if ! command -v systemctl >/dev/null 2>&1; then
     err "systemctl not available; aborting"
@@ -106,7 +81,54 @@ ensure_systemd(){
   fi
 }
 
-# BEGIN
+detect_docker_container_publishing_port(){
+  local port=$1
+  if ! command -v docker >/dev/null 2>&1; then echo ""; return 0; fi
+  docker ps --format '{{.ID}}\t{{.Names}}\t{{.Ports}}' | awk -v p=":${port}->" '$0 ~ p { print $1; exit }'
+}
+
+wait_for_db_tcp(){
+  local timeout=${1:-$DB_TIMEOUT}
+  local elapsed=0
+  while [ $elapsed -lt $timeout ]; do
+    if bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/${DB_PORT}" >/dev/null 2>&1; then
+      log "DB listening on 127.0.0.1:${DB_PORT}"
+      return 0
+    fi
+    sleep $DB_POLL_INTERVAL
+    elapsed=$((elapsed + DB_POLL_INTERVAL))
+  done
+  return 1
+}
+
+try_http_probe(){
+  local timeout=${1:-$HEALTH_TIMEOUT}
+  local elapsed=0
+  local addrs="$HTTP_ENDPOINT http://127.0.0.1:${NODE_PORT}/health"
+  # also try raw advertised host without trailing path if BASE_URL contained host only
+  while [ $elapsed -lt $timeout ]; do
+    for u in $addrs; do
+      if curl -fsS -m 3 "$u" >/dev/null 2>&1; then
+        log "HTTP probe ok $u"
+        return 0
+      fi
+    done
+    sleep $HTTP_POLL_INTERVAL
+    elapsed=$((elapsed + HTTP_POLL_INTERVAL))
+  done
+  return 1
+}
+
+restore_unit_state(){
+  # leave enabled/disabled as before; attempt to re-enable if it was enabled before
+  if [ "${PRE_ENABLED:-0}" -eq 1 ]; then
+    sudo systemctl enable --now "${UNIT}" >/dev/null 2>&1 || true
+  else
+    sudo systemctl disable "${UNIT}" >/dev/null 2>&1 || true
+  fi
+}
+
+# MAIN
 ensure_systemd
 
 if ! systemctl list-unit-files --type=service --all | grep -q "^${UNIT}"; then
@@ -120,12 +142,12 @@ if systemctl is-enabled --quiet "${UNIT}" 2>/dev/null; then PRE_ENABLED=1; fi
 sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
 sudo systemctl daemon-reload >/dev/null 2>&1 || true
 
-# detect container publishing DB_PORT
 CID=$(detect_docker_container_publishing_port "${DB_PORT}" || true)
-if [ -n "${CID}" ]; then
-  log "Detected container ${CID} publishing host port ${DB_PORT}"
+PROJECT=""
+SERVICE_LABEL=""
 
-  # detect compose labels
+if [ -n "$CID" ]; then
+  log "Detected Docker container ${CID} publishing host port ${DB_PORT}"
   PROJECT=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}' "${CID}" 2>/dev/null || true)
   SERVICE_LABEL=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.service" }}' "${CID}" 2>/dev/null || true)
 
@@ -147,7 +169,7 @@ else
   log "No DB container found publishing port ${DB_PORT}"
 fi
 
-# Start DB back (if compose-managed prefer compose start, else start container if exists)
+# start DB back (compose preferred)
 if [ -n "${CID}" ]; then
   if [ -n "$PROJECT" ] && [ -n "$SERVICE_LABEL" ] && command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1 2>/dev/null; then
     log "Starting compose service ${SERVICE_LABEL} in project ${PROJECT}"
@@ -156,8 +178,7 @@ if [ -n "${CID}" ]; then
     log "Starting compose service ${SERVICE_LABEL} in project ${PROJECT} (docker-compose)"
     sudo docker-compose -p "${PROJECT}" start "${SERVICE_LABEL}" >/dev/null 2>&1 || true
   else
-    # try to start the same container id if it still exists; otherwise rely on docker to recreate it
-    if docker inspect "${CID}" >/dev/null 2>&1; then
+    if command -v docker >/dev/null 2>&1 && docker inspect "${CID}" >/dev/null 2>&1; then
       log "Starting container ${CID}"
       sudo docker start "${CID}" >/dev/null 2>&1 || true
     else
@@ -166,11 +187,22 @@ if [ -n "${CID}" ]; then
   fi
 fi
 
-log "2) Wait for DB to be reachable before starting node"
-if ! wait_for_db; then
-  err "DB unreachable; unmasking unit and aborting"
-  sudo systemctl unmask "${UNIT}" >/dev/null 2>&1 || true
-  exit 1
+log "2) Wait for DB to be reachable (TCP) before starting node"
+if ! wait_for_db_tcp $DB_TIMEOUT; then
+  err "DB did not become reachable on ${DB_PORT} within ${DB_TIMEOUT}s"
+  if [ "$FORCE" = true ]; then
+    err "Force: killing holders on ${DB_PORT}"
+    sudo lsof -ti :"${DB_PORT}" | xargs -r sudo kill -9 || true
+    sleep 1
+    if ! wait_for_db_tcp $DB_TIMEOUT; then
+      err "DB still unreachable after force; aborting"
+      sudo systemctl unmask "${UNIT}" >/dev/null 2>&1 || true
+      exit 1
+    fi
+  else
+    sudo systemctl unmask "${UNIT}" >/dev/null 2>&1 || true
+    exit 1
+  fi
 fi
 
 log "3) Start node unit (unmasking temporarily to allow management)"
@@ -182,31 +214,32 @@ sudo systemctl start "${UNIT}" || {
   exit 1
 }
 
-log "Waiting for ${UNIT} to become active and responsive"
-if ! wait_for_unit_active "${UNIT}"; then
-  err "${UNIT} did not become active within timeout; re-masking and aborting"
-  journalctl -u "${UNIT}" --no-pager -n 160 || true
+log "Waiting for ${UNIT} to become active (systemd)"
+waited=0
+while [ $waited -lt $HEALTH_TIMEOUT ]; do
+  if systemctl is-active --quiet "${UNIT}"; then break; fi
+  sleep 1
+  waited=$((waited+1))
+done
+if ! systemctl is-active --quiet "${UNIT}"; then
+  err "${UNIT} did not become active within ${HEALTH_TIMEOUT}s; re-masking and aborting"
+  journalctl -u "${UNIT}" --no-pager -n 120 || true
   sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
   exit 1
 fi
 
-if ! tcp_probe_once "${NODE_PORT}"; then
-  err "Node not responding on TCP port ${NODE_PORT} after start; re-masking and aborting"
-  journalctl -u "${UNIT}" --no-pager -n 160 || true
+log "4) Wait for HTTP /health to respond (this may take a while)"
+if ! try_http_probe 60; then
+  err "Node HTTP /health did not respond within probe timeout"
+  journalctl -u "${UNIT}" --no-pager -n 200 || true
   sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
   exit 1
 fi
 
 log "Node started and responsive on ${NODE_PORT}"
-log "Note: simplified helper does not persist previous container restart policy"
-log "4) Restore systemd enablement/state for ${UNIT}"
-if [ "${PRE_ENABLED}" -eq 1 ]; then
-  log "Re-enabling and ensuring ${UNIT} is active under systemd"
-  sudo systemctl enable --now "${UNIT}" >/dev/null 2>&1 || true
-else
-  log "Leaving ${UNIT} disabled but unmasked"
-  sudo systemctl disable "${UNIT}" >/dev/null 2>&1 || true
-fi
+
+log "5) Restore systemd enablement/state for ${UNIT}"
+restore_unit_state
 
 log "Restart procedure complete"
 exit 0
