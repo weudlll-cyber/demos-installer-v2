@@ -1,7 +1,6 @@
 #!/bin/bash
 # Unified helper script for inspecting and repairing the Demos Node systemd service.
 # Supports: --status, --logs=N, --health, --autorestart, --restart
-
 set -u
 IFS=$'\n\t'
 
@@ -56,12 +55,28 @@ fi
 
 # === Functions ===
 restart_node() {
-  echo -e "\e[91m🔄 Attempting to restart $UNIT_NAME...\e[0m"
-  systemctl restart "$UNIT_NAME" && echo -e "\e[91m✅ Restart successful.\e[0m" || {
-    echo -e "\e[91m❌ Restart failed. Try manually:\e[0m"
-    echo -e "\e[91msudo systemctl restart $UNIT_NAME\e[0m"
-    exit 1
-  }
+  echo -e "\e[91m🔄 Delegating restart to restart_demos_node helper...\e[0m"
+  # prefer symlink in /usr/local/bin, fall back to /opt path
+  if command -v restart_demos_node &>/dev/null; then
+    sudo restart_demos_node && echo -e "\e[91m✅ restart_demos_node completed.\e[0m" || {
+      echo -e "\e[91m❌ restart_demos_node failed. Try manually:\e[0m"
+      echo -e "\e[91msudo restart_demos_node --force\e[0m"
+      exit 1
+    }
+  elif [ -x "/opt/demos-node/helpers/restart_demos_node" ]; then
+    sudo /opt/demos-node/helpers/restart_demos_node && echo -e "\e[91m✅ restart script completed.\e[0m" || {
+      echo -e "\e[91m❌ restart script failed. Try manually:\e[0m"
+      echo -e "\e[91msudo /opt/demos-node/helpers/restart_demos_node --force\e[0m"
+      exit 1
+    }
+  else
+    echo -e "\e[91m❌ restart_demos_node helper not found. Falling back to systemctl restart.\e[0m"
+    systemctl restart "$UNIT_NAME" && echo -e "\e[91m✅ Restart successful.\e[0m" || {
+      echo -e "\e[91m❌ Restart failed. Try manually:\e[0m"
+      echo -e "\e[91msudo systemctl restart $UNIT_NAME\e[0m"
+      exit 1
+    }
+  fi
 }
 
 check_health() {
@@ -129,7 +144,7 @@ case "$COMMAND" in
     if curl -fs "$HTTP_ENDPOINT" &>/dev/null; then
       echo -e "\e[91m✅ Node is healthy. No restart needed.\e[0m"
     else
-      echo -e "\e[91m⚠️ Unhealthy. Restarting...\e[0m"
+      echo -e "\e[91m⚠️ Unhealthy. Restarting via restart_demos_node helper...\e[0m"
       restart_node
     fi
     ;;
