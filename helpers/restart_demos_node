@@ -49,7 +49,8 @@ ensure_systemd(){
 is_listening(){ ss -tuln | grep -q ":${1} " && return 0 || return 1; }
 
 wait_for_unit_active(){
-  local unit=$1 waited=0
+  unit=$1
+  waited=0
   while [ $waited -lt "$HEALTH_TIMEOUT" ]; do
     if systemctl is-active --quiet "$unit"; then return 0; fi
     sleep "$HEALTH_INTERVAL"
@@ -59,7 +60,7 @@ wait_for_unit_active(){
 }
 
 tcp_probe(){
-  local port=$1
+  port=$1
   if command -v timeout >/dev/null 2>&1; then
     timeout 3 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/${port}" >/dev/null 2>&1 && return 0 || return 1
   else
@@ -68,7 +69,7 @@ tcp_probe(){
 }
 
 detect_docker_container_publishing_port(){
-  local port=$1
+  port=$1
   if ! command -v docker >/dev/null 2>&1; then
     echo ""
     return 0
@@ -77,7 +78,7 @@ detect_docker_container_publishing_port(){
 }
 
 record_db_state(){
-  local cid=$1
+  cid=$1
   mkdir -p "$STATE_DIR"
   if [ -n "$cid" ]; then
     echo "$cid" > "$DB_STATE_FILE"
@@ -87,14 +88,12 @@ record_db_state(){
 }
 
 record_policy(){
-  local cid=$1
+  cid=$1
   if [ -z "$cid" ]; then
     rm -f "$DB_POLICY_FILE" || true
     return 0
   fi
-  local pol
   pol=$(docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' "$cid" 2>/dev/null || true)
-  # write whatever we got (may be empty -> treated as "no")
   echo "${pol:-no}" > "$DB_POLICY_FILE"
 }
 
@@ -102,23 +101,21 @@ restore_policy_and_start(){
   if [ ! -f "$DB_STATE_FILE" ]; then
     return 0
   fi
-  local cid
   cid=$(cat "$DB_STATE_FILE" 2>/dev/null || true)
-  [ -z "$cid" ] && rm -f "$DB_STATE_FILE" "$DB_POLICY_FILE" || true && return 0
+  if [ -z "$cid" ]; then
+    rm -f "$DB_STATE_FILE" "$DB_POLICY_FILE" || true
+    return 0
+  fi
   if ! command -v docker >/dev/null 2>&1; then
     err "docker not present; cannot restore container ${cid}"
     return 0
   fi
 
-  # restore restart policy if recorded
   if [ -f "$DB_POLICY_FILE" ]; then
-    local oldpol
     oldpol=$(cat "$DB_POLICY_FILE" || echo "no")
-    # if container exists, attempt to restore its policy
     if docker inspect "$cid" >/dev/null 2>&1; then
       log "Restoring restart policy '${oldpol}' for container ${cid}"
       sudo docker update --restart="${oldpol}" "$cid" >/dev/null 2>&1 || true
-      # start the container if it is not running and was previously recorded as running
       if ! docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null | grep -q 'true'; then
         log "Starting container ${cid}"
         sudo docker start "$cid" >/dev/null 2>&1 || true
@@ -128,7 +125,6 @@ restore_policy_and_start(){
     fi
   fi
 
-  # cleanup state files
   rm -f "$DB_STATE_FILE" "$DB_POLICY_FILE" || true
 }
 
@@ -140,39 +136,31 @@ if ! systemctl list-unit-files --type=service --all | grep -q "^${UNIT}"; then
   exit 1
 fi
 
-# 1) Mask node unit to prevent systemd from auto-restarting while we operate
 log "1) Masking ${UNIT} to prevent automatic restarts while we operate"
 PRE_ENABLED=0
 if systemctl is-enabled --quiet "${UNIT}" 2>/dev/null; then PRE_ENABLED=1; fi
 sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
 sudo systemctl daemon-reload >/dev/null 2>&1 || true
 
-# 2) Detect docker container publishing DB port; if found, record policy and disable restart then stop it
+# Detect docker container publishing DB port; if found, record policy and disable restart then stop it
 CID=$(detect_docker_container_publishing_port "${DB_PORT}" || true)
 if [ -n "${CID}" ]; then
   log "Detected Docker container ${CID} publishing host port ${DB_PORT}"
-  # record current restart policy and container id
   record_policy "$CID"
   record_db_state "$CID"
-  local OLD_POLICY
   OLD_POLICY=$(cat "$DB_POLICY_FILE" 2>/dev/null || echo "no")
   log "Recorded restart policy '${OLD_POLICY}' for container ${CID}"
-  # temporarily disable automatic restarts to avoid immediate rebinding
   if [ "$OLD_POLICY" != "no" ]; then
     log "Temporarily disabling restart policy for ${CID}"
     sudo docker update --restart=no "$CID" >/dev/null 2>&1 || true
   fi
-  # stop the container gracefully
   log "Stopping Docker container ${CID}"
   sudo docker stop --time 10 "$CID" >/dev/null 2>&1 || {
     err "docker stop failed for ${CID}; proceeding but container may still bind port"
   }
   sleep 1
-  # give docker-proxy a moment and try to clear; if docker proxy persists we'll handle later
-  sleep 1
 fi
 
-# 3) Stop node unit if active
 log "2) Stop the node unit if active"
 if systemctl is-active --quiet "${UNIT}"; then
   sudo systemctl stop "${UNIT}" || true
@@ -182,7 +170,6 @@ else
   log "${UNIT} not active"
 fi
 
-# 4) Ensure NODE_PORT is free
 log "3) Ensure NODE_PORT=${NODE_PORT} is free"
 if is_listening "${NODE_PORT}"; then
   err "Node port ${NODE_PORT} still in use"
@@ -199,7 +186,6 @@ else
   log "Node port free"
 fi
 
-# 5) Ensure DB_PORT is free (if still bound, either try gentle clearance or fail)
 log "4) Ensure DB_PORT=${DB_PORT} is free"
 if is_listening "${DB_PORT}"; then
   err "DB port ${DB_PORT} still in use after stopping container"
@@ -217,7 +203,6 @@ else
   log "DB port free"
 fi
 
-# 6) Start node unit (unmask temporarily to allow management)
 log "5) Start node unit (unmasking temporarily to allow management)"
 sudo systemctl unmask "${UNIT}" >/dev/null 2>&1 || true
 sudo systemctl daemon-reload >/dev/null 2>&1 || true
@@ -228,7 +213,6 @@ sudo systemctl start "${UNIT}" || {
   exit 1
 }
 
-# wait for active and tcp health
 log "Waiting for ${UNIT} to become active and responsive"
 if ! wait_for_unit_active "${UNIT}"; then
   err "${UNIT} did not become active within timeout; restoring DB policy and re-masking"
@@ -248,11 +232,9 @@ fi
 
 log "Node started and responsive on ${NODE_PORT}"
 
-# 7) Restore Docker container restart policy and start container again if it was recorded
 log "6) Restoring DB container restart policy and starting container if needed (best-effort)"
 restore_policy_and_start
 
-# 8) Restore systemd enablement/state for node
 log "7) Restore systemd enablement/state for ${UNIT}"
 if [ "${PRE_ENABLED}" -eq 1 ]; then
   log "Re-enabling and ensuring ${UNIT} is active under systemd"
