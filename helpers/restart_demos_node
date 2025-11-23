@@ -1,5 +1,6 @@
+sudo tee /opt/demos-node/helpers/restart_demos_node > /dev/null <<'EOF'
 #!/bin/bash
-# restart_demos_node — compact, safe restart flow with explanatory comments
+# restart_demos_node — compact, safe restart flow with red messages
 # - Mask unit to avoid flapping
 # - Stop DB (compose if available, else stop container)
 # - Start DB and wait for local TCP readiness
@@ -15,9 +16,9 @@ DB_PORT=5332
 DB_WAIT=30    # seconds to wait for DB TCP
 HTTP_WAIT=60  # seconds to wait for HTTP /health
 
-# small helpers
-log(){ printf "[+] %s\n" "$*"; }
-err(){ printf "[!] %s\n" "$*" >&2; }
+# small helpers (all messages printed in red)
+log(){ printf "\e[91m%s\e[0m\n" "$*"; }
+err(){ printf "\e[91m%s\e[0m\n" "$*" >&2; }
 
 # read NODE_PORT override if present
 if [ -f "$ENV" ]; then
@@ -70,7 +71,6 @@ if [ -n "$CID" ]; then
     sudo docker compose -p "$PROJECT" stop "$SERVICE_LABEL" || true
     sudo docker compose -p "$PROJECT" start "$SERVICE_LABEL" || true
   else
-    # fallback: disable restart and stop container, then try start
     sudo docker update --restart=no "$CID" >/dev/null 2>&1 || true
     sudo docker stop --time 10 "$CID" >/dev/null 2>&1 || true
     sudo docker start "$CID" >/dev/null 2>&1 || true
@@ -89,11 +89,11 @@ fi
 log "Unmasking and starting ${UNIT}"
 sudo systemctl unmask "${UNIT}" >/dev/null 2>&1 || true
 sudo systemctl daemon-reload >/dev/null 2>&1 || true
-sudo systemctl start "${UNIT}" || {
+if ! sudo systemctl start "${UNIT}"; then
   err "systemctl start failed; re-masking and aborting"
   sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
   exit 1
-}
+fi
 
 log "Waiting for HTTP /health on port ${NODE_PORT} up to ${HTTP_WAIT}s"
 if ! http_probe "${HTTP_WAIT}"; then
@@ -112,4 +112,9 @@ else
 fi
 
 log "Restart complete — node responsive"
-exit 0exit 0
+exit 0
+EOF
+
+sudo chmod +x /opt/demos-node/helpers/restart_demos_node
+sudo ln -sf /opt/demos-node/helpers/restart_demos_node /usr/local/bin/restart_demos_node
+hash -r
