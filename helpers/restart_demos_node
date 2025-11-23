@@ -1,4 +1,3 @@
-sudo tee /opt/demos-node/helpers/restart_demos_node > /dev/null <<'EOF'
 #!/bin/bash
 # restart_demos_node — compact, safe restart flow with red messages
 # - Mask unit to avoid flapping
@@ -113,8 +112,3 @@ fi
 
 log "Restart complete — node responsive"
 exit 0
-EOF
-
-sudo chmod +x /opt/demos-node/helpers/restart_demos_node
-sudo ln -sf /opt/demos-node/helpers/restart_demos_node /usr/local/bin/restart_demos_node
-hash -r
