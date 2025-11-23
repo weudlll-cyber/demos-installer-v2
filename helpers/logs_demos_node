@@ -12,28 +12,60 @@ ENV_PATH="/opt/demos-node/.env"
 NODE_PORT=53550
 BASE_URL="http://127.0.0.1:$NODE_PORT"
 
+_trim_trailing() {
+  local s="$1"
+  s="${s%/}"    # remove trailing slash
+  s="${s%:}"    # remove trailing colon
+  # trim surrounding whitespace
+  s="$(printf "%s" "$s" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  printf '%s' "$s"
+}
+
+# load and normalise .env values if present
 if [ -f "$ENV_PATH" ]; then
-  NODE_PORT=$(grep "^NODE_PORT=" "$ENV_PATH" | cut -d'=' -f2 || echo "53550")
-  EXPOSED_URL=$(grep "^EXPOSED_URL=" "$ENV_PATH" | cut -d'=' -f2 || true)
-  EXPOSED_IP=$(grep "^EXPOSED_IP=" "$ENV_PATH" | cut -d'=' -f2 || true)
+  NODE_PORT=$(grep -m1 "^NODE_PORT=" "$ENV_PATH" | cut -d'=' -f2 || echo "53550")
+  # fallback if empty
+  NODE_PORT=${NODE_PORT:-53550}
+
+  EXPOSED_URL=$(grep -m1 "^EXPOSED_URL=" "$ENV_PATH" | cut -d'=' -f2 || true)
+  EXPOSED_IP=$(grep -m1 "^EXPOSED_IP=" "$ENV_PATH" | cut -d'=' -f2 || true)
+
+  EXPOSED_URL=${EXPOSED_URL:-}
+  EXPOSED_IP=${EXPOSED_IP:-}
 
   if [ -n "$EXPOSED_URL" ]; then
-    BASE_URL="$EXPOSED_URL"
-    # Append port if missing
-    if [[ "$BASE_URL" != *":$NODE_PORT" ]]; then
-      BASE_URL="${BASE_URL}:$NODE_PORT"
+    # ensure scheme present
+    if [[ "$EXPOSED_URL" != http://* && "$EXPOSED_URL" != https://* ]]; then
+      EXPOSED_URL="http://$EXPOSED_URL"
     fi
-  elif [ -n "$EXPOSED_IP" ]; then
-    if [[ "$EXPOSED_IP" == *:* ]]; then
-      BASE_URL="http://[$EXPOSED_IP]:$NODE_PORT"
+
+    base="$(_trim_trailing "$EXPOSED_URL")"
+
+    # remove scheme for port-detection
+    hostport="${base#http://}"
+    hostport="${hostport#https://}"
+
+    # if hostport already ends with :<digits> assume a port exists
+    if [[ "$hostport" =~ :[0-9]+$ ]]; then
+      BASE_URL="$base"
     else
-      BASE_URL="http://$EXPOSED_IP:$NODE_PORT"
+      BASE_URL="${base}:$NODE_PORT"
+    fi
+
+  elif [ -n "$EXPOSED_IP" ]; then
+    ip="$(_trim_trailing "$EXPOSED_IP")"
+    if [[ "$ip" == *:* ]]; then
+      BASE_URL="http://[$ip]:$NODE_PORT"
+    else
+      BASE_URL="http://$ip:$NODE_PORT"
     fi
   else
     BASE_URL="http://127.0.0.1:$NODE_PORT"
   fi
 fi
 
+# ensure single trailing slash behavior and final endpoint
+BASE_URL="${BASE_URL%/}"
 HTTP_ENDPOINT="${BASE_URL}/health"
 
 # === Systemd & journalctl checks ===
@@ -56,7 +88,6 @@ fi
 # === Functions ===
 restart_node() {
   echo -e "\e[91m🔄 Delegating restart to restart_demos_node helper...\e[0m"
-  # prefer symlink in /usr/local/bin, fall back to /opt path
   if command -v restart_demos_node &>/dev/null; then
     sudo restart_demos_node && echo -e "\e[91m✅ restart_demos_node completed.\e[0m" || {
       echo -e "\e[91m❌ restart_demos_node failed. Try manually:\e[0m"
@@ -101,7 +132,10 @@ check_health() {
     echo -e "\e[91m⚠️ No active process found.\e[0m"
   fi
 
-  echo -e "\e[91m🌐 Checking HTTP endpoint: $HTTP_ENDPOINT\e[0m"
+  echo -e "\e[91m🌐 Checking HTTP endpoint: $HTTP_ENDPOINT\e[0m" >&2
+  # debug: print endpoint before probing (helps catch malformed URLs)
+  echo -e "\e[90mDEBUG: HTTP_ENDPOINT='$HTTP_ENDPOINT'\e[0m" >&2
+
   if curl -fs "$HTTP_ENDPOINT" &>/dev/null; then
     echo -e "\e[91m✅ HTTP endpoint is responsive.\e[0m"
   else
