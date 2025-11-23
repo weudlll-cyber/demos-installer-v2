@@ -5,6 +5,7 @@
 # - Auto-installs pnpm if required by package preinstall scripts
 # - Runs bun pm trust --all, bun install, and bun rebuild in a retry loop
 # - Logs detailed bun activity to /var/log/demos-node-bun.log
+# - Writes a step marker so re-runs are safe and fast
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -12,7 +13,7 @@ IFS=$'\n\t'
 echo -e "\e[91m🔧 [04] Cloning Demos Node repository and installing dependencies...\e[0m"
 echo -e "\e[91mThis step sets up the node codebase in /opt/demos-node and ensures Bun deps are installed and trusted.\e[0m"
 
-# ---------- markers ----------
+# ---------- markers (idempotency) ----------
 MARKER_DIR="/root/.demos_node_setup"
 STEP_MARKER="$MARKER_DIR/04_clone_repo.done"
 mkdir -p "$MARKER_DIR"
@@ -23,13 +24,13 @@ if [ -f "$STEP_MARKER" ]; then
 fi
 
 # ---------- resolve bun binary for non-interactive contexts ----------
-# Prefer a stable global symlink at /usr/local/bin/bun; fallback to any available bun binary
+# Prefer global symlink at /usr/local/bin/bun, fallback to any available bun binary,
+# create symlink if bun is installed under /root/.bun but not globally linked.
 if command -v /usr/local/bin/bun &>/dev/null; then
   BUN_BIN="/usr/local/bin/bun"
 elif command -v bun &>/dev/null; then
   BUN_BIN="$(command -v bun)"
 elif [ -x "/root/.bun/bin/bun" ]; then
-  # Create the stable symlink for future runs
   ln -sf /root/.bun/bin/bun /usr/local/bin/bun
   BUN_BIN="/usr/local/bin/bun"
 else
@@ -43,31 +44,34 @@ export BUN_BIN
 export PATH="$(dirname "$BUN_BIN"):$PATH"
 echo -e "\e[93m🔍 Using bun binary: $BUN_BIN\e[0m"
 
-# ---------- clone repository (idempotent) ----------
+# ---------- repo settings ----------
 REPO_URL="https://github.com/kynesyslabs/node.git"
 TARGET_DIR="/opt/demos-node"
 
-echo -e "\e[93m📥 Cloning Demos Node repository into $TARGET_DIR...\e[0m"
+# ---------- clone repository (idempotent; keep current branch synced) ----------
+echo -e "\e[93m📥 Cloning or updating Demos Node repository into $TARGET_DIR...\e[0m"
 if [ -d "${TARGET_DIR}/.git" ]; then
-  echo -e "\e[93m⚠️ Repository already present at ${TARGET_DIR}. Pulling latest changes instead of fresh clone.\e[0m"
+  echo -e "\e[93m⚠️ Repository exists at ${TARGET_DIR}. Fetching and resetting to remote HEAD.\e[0m"
   cd "$TARGET_DIR"
-  git fetch --all --tags --prune || true
-  git reset --hard origin/HEAD || true
+  git fetch --all --tags --prune >> /var/log/git-demos-node.log 2>&1 || true
+  # Try to reset to remote HEAD; do not fail the entire script on non-critical git issues
+  git reset --hard origin/HEAD >> /var/log/git-demos-node.log 2>&1 || true
 else
   rm -rf "$TARGET_DIR" 2>/dev/null || true
-  if ! git clone "$REPO_URL" "$TARGET_DIR"; then
+  if ! git clone "$REPO_URL" "$TARGET_DIR" >> /var/log/git-demos-node.log 2>&1; then
     echo -e "\e[91m❌ Git clone failed. Check network/GitHub access and retry.\e[0m"
+    echo -e "\e[91mSee /var/log/git-demos-node.log for details.\e[0m"
     exit 1
   fi
 fi
 
-# ---------- prepare bun log ----------
+# ---------- prepare bun log (detailed) ----------
 BUN_LOG="/var/log/demos-node-bun.log"
 mkdir -p "$(dirname "$BUN_LOG")"
 : > "$BUN_LOG"
 
-# ---------- install dependencies with bun (first attempt) ----------
-echo -e "\e[93m📦 Installing dependencies with Bun (first attempt)...\e[0m"
+# ---------- install dependencies with bun (initial attempt) ----------
+echo -e "\e[93m📦 Installing dependencies with Bun (initial attempt)...\e[0m"
 cd "$TARGET_DIR"
 
 if [ -f "bun.lockb" ] || [ -f "package.json" ]; then
@@ -75,7 +79,7 @@ if [ -f "bun.lockb" ] || [ -f "package.json" ]; then
     echo -e "\e[93m⚠️ bun install initially failed. Cleaning bun cache and retrying...\e[0m"
     "$BUN_BIN" cache clean 2>/dev/null || true
     if ! "$BUN_BIN" install >> "$BUN_LOG" 2>&1; then
-      echo -e "\e[91m❌ bun install failed after retry. Check $BUN_LOG for details.\e[0m"
+      echo -e "\e[91m❌ bun install failed after retry. Inspect $BUN_LOG and re-run the installer.\e[0m"
       exit 1
     fi
   fi
@@ -83,26 +87,33 @@ else
   echo -e "\e[93m⚠️ No bun.lockb or package.json found in repo; skipping dependency install.\e[0m"
 fi
 
-# ---------- ensure pnpm present (some packages require pnpm in lifecycle scripts) ----------
-# Install pnpm globally if it's missing to satisfy preinstall scripts that explicitly call pnpm
+# ---------- ensure pnpm present early ----------
+# Some packages run pnpm in preinstall; install pnpm so those scripts can run
+echo -e "\e[93m🔧 Ensuring pnpm is available (some packages expect pnpm in lifecycle scripts)...\e[0m"
 if ! command -v pnpm &>/dev/null; then
-  echo -e "\e[93m🔧 pnpm not found. Installing pnpm globally to satisfy package preinstall scripts...\e[0m"
-  # Use npm to install pnpm; tolerate failure but continue (we'll retry later)
+  # Use npm to install pnpm globally; tolerant to failure but check after
   npm install -g pnpm >> "$BUN_LOG" 2>&1 || true
-  if command -v pnpm &>/dev/null; then
-    echo -e "\e[92m✅ pnpm installed and available.\e[0m"
-  else
-    echo -e "\e[93m⚠️ pnpm installation failed or is not in PATH. Some package preinstalls may require pnpm.\e[0m"
-  fi
+fi
+if command -v pnpm &>/dev/null; then
+  echo -e "\e[92m✅ pnpm available at: $(command -v pnpm)\e[0m"
+else
+  echo -e "\e[93m⚠️ pnpm not available after attempted install. pnpm-dependent preinstall scripts may fail.\e[0m"
+fi
+
+# ---------- run a pnpm pass to satisfy pnpm-specific preinstalls (non-fatal) ----------
+if [ -f "package.json" ] && command -v pnpm &>/dev/null; then
+  echo -e "\e[93m📦 Running pnpm install to allow pnpm-based preinstalls to complete...\e[0m"
+  # ignore-scripts=false => allow preinstall / postinstall scripts run by pnpm
+  pnpm install --ignore-scripts=false >> "$BUN_LOG" 2>&1 || true
 fi
 
 # ---------- automated trust / postinstall repair loop ----------
-# This loop will:
-#  - run bun pm trust --all
-#  - run bun install again
-#  - attempt bun rebuild (if project exposes such task)
-#  - run pnpm install (non-optional) if remaining blocked packages suggest pnpm usage
-# Repeat until no blocked packages remain or retries exhausted
+# This loop attempts to resolve blocked lifecycle scripts automatically:
+# - bun pm trust --all
+# - bun install
+# - bun rebuild (if available)
+# - pnpm install if pnpm is present and further preinstalls needed
+# Loop until pm untrusted is empty or attempts exhausted.
 echo -e "\e[93m🔐 Ensuring Bun packages are trusted and postinstalls have run (logs: $BUN_LOG)...\e[0m"
 
 MAX_ATTEMPTS=4
@@ -124,26 +135,24 @@ while [ "$attempt" -lt "$MAX_ATTEMPTS" ]; do
     "$BUN_BIN" install || true
 
     echo "=== bun rebuild (if supported) ==="
-    # bun rebuild might not exist for the project; avoid hard fail
     "$BUN_BIN" rebuild || true
   } >> "$BUN_LOG" 2>&1 || true
 
-  # If no untrusted entries are reported, success
+  # Success condition: no untrusted packages reported
   if ! "$BUN_BIN" pm untrusted | grep -q '.'; then
     echo -e "\e[92m✅ Bun packages trusted and postinstalls attempted (attempt $attempt).\e[0m"
     break
   fi
 
-  # If still untrusted and pnpm exists, try pnpm install to satisfy pnpm-only preinstall logic
+  # If still untrusted and pnpm exists, attempt pnpm install to satisfy pnpm-specific preinstalls
   if command -v pnpm &>/dev/null; then
-    echo -e "\e[93mℹ️ Some packages still blocked; attempting pnpm install to satisfy pnpm-based scripts (attempt $attempt)...\e[0m"
-    # Run pnpm install in project to allow pnpm-run preinstall scripts to complete
+    echo -e "\e[93mℹ️ Untrusted packages remain; running pnpm install to satisfy pnpm-based scripts (attempt $attempt)...\e[0m"
     pnpm install --ignore-scripts=false >> "$BUN_LOG" 2>&1 || true
   else
     echo -e "\e[93mℹ️ pnpm not available; skipping pnpm attempt (attempt $attempt).\e[0m"
   fi
 
-  echo -e "\e[93m⚠️ Some packages remain untrusted after attempt $attempt. Retrying after short backoff...\e[0m"
+  echo -e "\e[93m⚠️ Some packages remain untrusted after attempt $attempt. Retrying after backoff...\e[0m"
   sleep $((attempt * 2))
 done
 
@@ -157,7 +166,7 @@ else
   echo -e "\e[92m✅ Bun dependency trust and postinstall sequence completed successfully.\e[0m"
 fi
 
-# ---------- verify the run script exists ----------
+# ---------- verify the run script exists and mark step complete ----------
 if [ -f "${TARGET_DIR}/run" ]; then
   echo -e "\e[92m✅ Node repository is ready (run script present).\e[0m"
   touch "$STEP_MARKER"
