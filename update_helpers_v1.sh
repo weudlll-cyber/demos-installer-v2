@@ -1,40 +1,63 @@
 #!/bin/bash
-# Update Demos Node helper scripts from GitHub and refresh symlinks.
-# Safe to run repeatedly; ensures helpers are current and executable.
+# update_helpers_auto_v1.sh
+# - Detects helper files in the repo's helpers/ directory via GitHub API
+# - Downloads each helper, makes it executable, and links it into /usr/local/bin
+# - Safe to run repeatedly; skips files that can't be fetched
 
 set -euo pipefail
 IFS=$'\n\t'
 
+# Configuration
 HELPER_DIR="/opt/demos-node/helpers"
 GLOBAL_BIN="/usr/local/bin"
-REPO_BASE_URL="https://raw.githubusercontent.com/weudlll-cyber/demos-installer-v2/main/helpers"
+GITHUB_OWNER="weudlll-cyber"
+GITHUB_REPO="demos-installer-v2"
+GITHUB_BRANCH="main"
+API_URL="https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/helpers?ref=${GITHUB_BRANCH}"
+RAW_BASE="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${GITHUB_BRANCH}/helpers"
 
-# Only the three helpers that exist in your repo
-HELPERS=("check_demos_node" "restart_demos_node" "stop_demos_node")
+mkdir -p "${HELPER_DIR}" "${GLOBAL_BIN}" || true
+echo "Fetching helper list from ${API_URL} ..."
 
-echo -e "\e[91m🔧 Updating Demos Node helpers...\e[0m"
-mkdir -p "$HELPER_DIR" "$GLOBAL_BIN" || true
+# Query GitHub API for files in helpers/ (public repo, no auth required)
+files_json="$(curl -fsSL "${API_URL}" 2>/dev/null || true)"
+if [ -z "${files_json}" ]; then
+  echo "Warning: unable to fetch helpers list from GitHub API; falling back to static known-names (if any)."
+  declare -a FILES=()
+else
+  # Extract filenames from JSON (safe simple parsing)
+  mapfile -t FILES < <(printf "%s\n" "${files_json}" | grep -oP '"name":\s*"\K[^"]+' || true)
+fi
 
-for helper in "${HELPERS[@]}"; do
-  src_url="${REPO_BASE_URL}/${helper}"   # no .sh suffix in repo
-  dst_path="${HELPER_DIR}/${helper}.sh"
-  tmp="${dst_path}.tmp.$$"
+# If API returned nothing, optionally define a conservative static fallback (empty here)
+if [ "${#FILES[@]}" -eq 0 ]; then
+  echo "No helper files detected via API and no fallback list provided. Exiting."
+  exit 0
+fi
 
-  echo -e "\e[91m📥 Fetching: ${src_url}\e[0m"
-  if ! curl -fsSL "$src_url" -o "$tmp"; then
-    echo -e "\e[91m❌ Failed to download ${helper} from ${src_url}\e[0m"
-    rm -f "$tmp" || true
-    exit 1
+echo "Detected helper files:"
+for f in "${FILES[@]}"; do echo "  - ${f}"; done
+
+# Download and install each file
+for fname in "${FILES[@]}"; do
+  # Ensure we only handle reasonable filenames and avoid directory traversal
+  safe_name="$(basename "${fname}")"
+  raw_url="${RAW_BASE}/${safe_name}"
+  dst_path="${HELPER_DIR}/${safe_name}"
+  tmp_path="${dst_path}.tmp.$$"
+
+  echo "Fetching ${raw_url} ..."
+  if curl -fsSL "${raw_url}" -o "${tmp_path}"; then
+    chmod +x "${tmp_path}"
+    mv -f "${tmp_path}" "${dst_path}"
+    ln -sf "${dst_path}" "${GLOBAL_BIN}/${safe_name%.*}" 2>/dev/null || ln -sf "${dst_path}" "${GLOBAL_BIN}/${safe_name}"
+    echo "Installed and linked: ${safe_name}"
+  else
+    echo "Warning: failed to fetch ${raw_url}; skipping ${safe_name}."
+    rm -f "${tmp_path}" || true
   fi
-
-  chmod +x "$tmp"
-  mv -f "$tmp" "$dst_path"
-  ln -sf "$dst_path" "${GLOBAL_BIN}/${helper}"
-  echo -e "\e[91m✅ Installed & linked: ${helper}\e[0m"
 done
 
-echo -e "\e[91m🎉 Helpers updated successfully.\e[0m"
-echo -e "\e[91mTry:\e[0m"
-echo -e "\e[91m  check_demos_node --status\e[0m"
-echo -e "\e[91m  stop_demos_node\e[0m"
-echo -e "\e[91m  restart_demos_node\e[0m"
+echo "Helpers update finished. Installed files in ${HELPER_DIR} and symlinked to ${GLOBAL_BIN}."
+echo "Available helper commands (symlinks):"
+ls -l "${GLOBAL_BIN}" | egrep "$(printf '%s|' "${FILES[@]}" | sed 's/|$//; s/\.sh//g')" || true
