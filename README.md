@@ -24,6 +24,13 @@ curl -fsSL https://raw.githubusercontent.com/weudlll-cyber/demos-installer-v2/ma
 curl -fsSL https://raw.githubusercontent.com/weudlll-cyber/demos-installer-v2/main/install_helpers_v1.sh | bash
 ```
 
+Update the Helper Tools
+```bash
+curl -fsSL "https://raw.githubusercontent.com/weudlll-cyber/demos-installer-v2/main/scripts/update_helpers_v1.sh" -o /tmp/update_helpers_v1.sh && chmod +x /tmp/update_helpers_v1.sh && sudo /tmp/update_helpers_v1.sh | bash
+```
+
+
+
 
 💡 The installer will automatically reboot once to finalize system upgrades.
 After reboot, re-run the same command or execute the script locally if you saved it.
