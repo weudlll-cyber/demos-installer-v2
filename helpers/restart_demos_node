@@ -1,8 +1,6 @@
 #!/bin/bash
-# This helper script restarts the Demos Node systemd service.
-# It ensures the node is restarted cleanly, frees DB port if needed,
-# and confirms the new status. Supports optional --force for aggressive cleanup.
-
+# restart_demos_node - stop system postgres unit first, stop node, ensure ports free,
+# start node, verify health, then restore postgres unit if it was running before.
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -10,14 +8,15 @@ SERVICE_NAME="demos-node"
 UNIT_NAME="${SERVICE_NAME}.service"
 ENV_FILE="/opt/demos-node/.env"
 
-# Defaults
 NODE_PORT=53550
 DB_PORT=5332
 FORCE=false
 RETRY_COUNT=2
 SLEEP_BETWEEN=2
+HEALTH_CHECK_TIMEOUT=20
+HEALTH_CHECK_INTERVAL=2
+POSTGRES_CANDIDATES=("postgresql" "postgresql.service")
 
-# Parse optional flag
 for arg in "$@"; do
   case "$arg" in
     --force) FORCE=true ;;
@@ -25,120 +24,209 @@ for arg in "$@"; do
   esac
 done
 
-log() { echo -e "\e[91m$*\e[0m"; }
+log() { printf "\e[91m%s\e[0m\n" "$*"; }
 
-# Load env if present
+# load env overrides
 if [ -f "$ENV_FILE" ]; then
   NODE_PORT=$(grep -m1 "^NODE_PORT=" "$ENV_FILE" | cut -d'=' -f2 || echo "$NODE_PORT")
   DB_PORT=$(grep -m1 "^DB_PORT=" "$ENV_FILE" | cut -d'=' -f2 || echo "$DB_PORT")
 fi
 
-kill_port_if_listening() {
-  local port="$1"
-  # Try to politely stop processes via systemd first (if it's postgres)
-  if ss -tuln | grep -q ":$port "; then
-    log "🔪 Port $port is in use — listing holders:"
-    ss -tulnpt | grep ":$port " || true
-    # attempt to stop system postgresql (may be the common case)
-    if systemctl list-units --type=service --all | grep -q '^postgresql'; then
-      log "⏸️ Attempting to stop system postgresql.service..."
-      sudo systemctl stop postgresql >/dev/null 2>&1 || true
+ensure_systemd() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    log "❌ systemctl not found; this host may not use systemd."
+    exit 1
+  fi
+}
+
+detect_postgres_unit() {
+  for u in "${POSTGRES_CANDIDATES[@]}"; do
+    if systemctl list-unit-files --type=service --all | grep -q "^${u}"; then
+      echo "$u"
+      return 0
+    fi
+  done
+  return 1
+}
+
+is_port_listening() {
+  ss -tuln | grep -q ":${1} " && return 0 || return 1
+}
+
+stop_postgres_if_running() {
+  POSTGRES_UNIT="$(detect_postgres_unit || true)"
+  POSTGRES_WAS_ACTIVE=0
+  if [ -n "${POSTGRES_UNIT}" ]; then
+    if systemctl is-active --quiet "${POSTGRES_UNIT}"; then
+      POSTGRES_WAS_ACTIVE=1
+      log "⏸ Stopping system postgres unit ${POSTGRES_UNIT} to avoid auto-restart on shutdown."
+      sudo systemctl stop "${POSTGRES_UNIT}" >/dev/null 2>&1 || true
       sleep 1
     fi
-    # If still present, optionally kill processes owning the port
-    if ss -tuln | grep -q ":$port "; then
-      if [ "$FORCE" = true ]; then
-        log "💀 Force mode: killing processes bound to port $port"
-        sudo lsof -ti :"$port" | xargs -r sudo kill -9 || true
-        sleep 1
-      else
-        return 1
-      fi
+  fi
+
+  # if DB port still in use, handle per FORCE
+  if is_port_listening "${DB_PORT}"; then
+    log "⚠ DB port ${DB_PORT} still in use after stopping postgres unit."
+    if [ "${FORCE}" = true ]; then
+      log "💀 Force: killing processes bound to ${DB_PORT}"
+      sudo lsof -ti :"${DB_PORT}" | xargs -r sudo kill -9 || true
+      sleep 1
+    else
+      return 1
     fi
   fi
   return 0
 }
 
-# Pre-checks
-if ! command -v systemctl &>/dev/null; then
-  log "❌ systemctl not found. This system may not support systemd."
-  exit 1
-fi
-if ! systemctl show "$UNIT_NAME" &>/dev/null; then
-  log "❌ Service $UNIT_NAME not found. Make sure the node was installed and service created."
-  exit 1
-fi
-
-log "🔄 Restarting Demos Node service: $UNIT_NAME"
-log "ℹ️ Using NODE_PORT=$NODE_PORT DB_PORT=$DB_PORT (from $ENV_FILE if present)"
-
-# Ensure DB port free before restart (common source of failures)
-if ! kill_port_if_listening "$DB_PORT"; then
-  log "⚠️ DB port $DB_PORT still occupied. Rerun with --force to kill holders, or stop them manually."
-  exit 1
-fi
-log "✅ DB port $DB_PORT free (or no action needed)."
-
-attempt_restart() {
-  if systemctl restart "$UNIT_NAME"; then
-    log "✅ Service restart command issued."
-    return 0
-  else
-    log "❌ systemctl restart failed."
-    return 1
+restore_postgres_if_needed() {
+  if [ "${POSTGRES_WAS_ACTIVE:-0}" -eq 1 ] && [ -n "${POSTGRES_UNIT:-}" ]; then
+    log "🔁 Restoring postgres unit ${POSTGRES_UNIT} (was active before)."
+    sudo systemctl enable --now "${POSTGRES_UNIT}" >/dev/null 2>&1 || true
   fi
 }
 
-# Try restart with retries
-i=0
-while [ $i -lt $RETRY_COUNT ]; do
-  if attempt_restart; then
-    sleep "$SLEEP_BETWEEN"
-    STATUS=$(systemctl is-active "$UNIT_NAME" || echo "unknown")
-    if [ "$STATUS" = "active" ]; then
-      PID=$(systemctl show -p MainPID "$UNIT_NAME" | cut -d= -f2 || echo 0)
-      PID=${PID:-0}
-      log "✅ Demos Node is running. Main PID after restart: $PID"
-      exit 0
-    fi
+stop_node_unit() {
+  if systemctl is-active --quiet "${UNIT_NAME}"; then
+    log "🛑 Stopping ${UNIT_NAME}."
+    sudo systemctl stop "${UNIT_NAME}" || true
+    sleep 1
+  else
+    log "ℹ ${UNIT_NAME} not active; nothing to stop."
   fi
-  i=$((i+1))
-  log "🔁 Retry $i/$RETRY_COUNT will run after $SLEEP_BETWEEN seconds..."
-  sleep "$SLEEP_BETWEEN"
+}
+
+start_node_unit() {
+  log "▶ Starting ${UNIT_NAME}."
+  sudo systemctl start "${UNIT_NAME}" || return 1
+  sleep 1
+  return 0
+}
+
+wait_for_node_active() {
+  local waited=0
+  while [ $waited -lt "${HEALTH_CHECK_TIMEOUT}" ]; do
+    if systemctl is-active --quiet "${UNIT_NAME}"; then
+      return 0
+    fi
+    sleep "${HEALTH_CHECK_INTERVAL}"
+    waited=$((waited + HEALTH_CHECK_INTERVAL))
+  done
+  return 1
+}
+
+node_tcp_healthy() {
+  if command -v timeout >/dev/null 2>&1 && command -v nc >/dev/null 2>&1; then
+    timeout 3 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/${NODE_PORT}" >/dev/null 2>&1 && return 0
+    return 1
+  else
+    is_port_listening "${NODE_PORT}" && return 0 || return 1
+  fi
+}
+
+# main
+ensure_systemd
+
+if ! systemctl list-unit-files --type=service --all | grep -q "^${UNIT_NAME}"; then
+  log "❌ Unit ${UNIT_NAME} not found; aborting."
+  exit 1
+fi
+
+log "🔄 Beginning safe restart: stop systemd-managed postgres first, then stop node."
+
+# 1) Stop system postgres so it won't auto-restart when node stops
+if ! stop_postgres_if_running; then
+  log "⚠ DB port ${DB_PORT} busy and not freed. Rerun with --force or free manually."
+  exit 1
+fi
+log "✅ Postgres handled. DB port ${DB_PORT} free or managed."
+
+# 2) Stop the node unit (systemd) while postgres is stopped
+stop_node_unit
+
+# 3) Ensure node port and DB port are not bound before starting node
+if is_port_listening "${NODE_PORT}"; then
+  log "⚠ Node port ${NODE_PORT} still in use."
+  if [ "${FORCE}" = true ]; then
+    log "💀 Force: killing processes bound to ${NODE_PORT}"
+    sudo lsof -ti :"${NODE_PORT}" | xargs -r sudo kill -9 || true
+    sleep 1
+  else
+    log "✋ Aborting: node port in use. Rerun with --force to kill holders."
+    restore_postgres_if_needed
+    exit 1
+  fi
+fi
+
+if is_port_listening "${DB_PORT}"; then
+  log "⚠ DB port ${DB_PORT} still in use after earlier handling."
+  if [ "${FORCE}" = true ]; then
+    log "💀 Force: killing processes bound to ${DB_PORT}"
+    sudo lsof -ti :"${DB_PORT}" | xargs -r sudo kill -9 || true
+    sleep 1
+  else
+    log "✋ Aborting: DB port still in use. Rerun with --force or free it manually."
+    restore_postgres_if_needed
+    exit 1
+  fi
+fi
+
+# 4) Start node unit and verify
+attempt=0
+started_ok=0
+while [ $attempt -lt $RETRY_COUNT ]; do
+  attempt=$((attempt+1))
+  log "🔁 Start attempt ${attempt}/${RETRY_COUNT}."
+  if start_node_unit; then
+    if wait_for_node_active; then
+      log "✅ systemd reports node unit active. Performing quick TCP check."
+      if node_tcp_healthy; then
+        log "✅ Node TCP port ${NODE_PORT} responsive."
+        started_ok=1
+        break
+      else
+        log "⚠ Node TCP port ${NODE_PORT} not responsive yet."
+      fi
+    else
+      log "⚠ Node unit did not become active within timeout."
+    fi
+  else
+    log "❌ Failed to start node unit (systemd start failed)."
+  fi
+  sleep "${SLEEP_BETWEEN}"
 done
 
-# If restart failed, try full stop + start fallback
-log "🔧 Restart attempts failed. Falling back to stop + start sequence."
-log "🛑 Stopping $UNIT_NAME..."
-systemctl stop "$UNIT_NAME" || true
+if [ "${started_ok}" -eq 1 ]; then
+  log "✅ Node started and passed basic health checks. Restoring system postgres if it was running before."
+  restore_postgres_if_needed
+  log "🎉 Restart complete."
+  exit 0
+fi
+
+# 5) Fallback: aggressive cleanup if requested, then try one final start
+log "🔧 Node did not become healthy. Performing fallback cleanup."
+sudo systemctl stop "${UNIT_NAME}" >/dev/null 2>&1 || true
 sleep 1
 
-# Extra cleanup if force
-if [ "$FORCE" = true ]; then
-  log "💀 Force: killing any lingering demos-node processes and freeing ports..."
+if [ "${FORCE}" = true ]; then
+  log "💀 Force: killing lingering node processes and freeing ports."
   pgrep -f "/opt/demos-node" | xargs -r sudo kill -9 || true
-  sudo lsof -ti :"$NODE_PORT" | xargs -r sudo kill -9 || true
-  sudo lsof -ti :"$DB_PORT" | xargs -r sudo kill -9 || true
+  sudo lsof -ti :"${NODE_PORT}" | xargs -r sudo kill -9 || true
+  sudo lsof -ti :"${DB_PORT}" | xargs -r sudo kill -9 || true
   sleep 1
 fi
 
-log "▶️ Starting $UNIT_NAME..."
-if systemctl start "$UNIT_NAME"; then
-  sleep 2
-  STATUS=$(systemctl is-active "$UNIT_NAME" || echo "unknown")
-  PID=$(systemctl show -p MainPID "$UNIT_NAME" | cut -d= -f2 || echo 0)
-  PID=${PID:-0}
-  if [ "$STATUS" = "active" ]; then
-    log "✅ Start successful. Main PID: $PID"
-    exit 0
-  else
-    log "⚠️ Service started but not active. Status: $STATUS"
-    log "📜 Recent logs (tail 40):"
-    journalctl -u "$UNIT_NAME" --no-pager -n 40 || true
-    exit 1
-  fi
-else
-  log "❌ Failed to start $UNIT_NAME. Showing recent logs:"
-  journalctl -u "$UNIT_NAME" --no-pager -n 60 || true
-  exit 1
+log "▶ Final start attempt..."
+if start_node_unit && wait_for_node_active && node_tcp_healthy; then
+  log "✅ Node started after fallback. Restoring postgres if needed."
+  restore_postgres_if_needed
+  exit 0
 fi
+
+log "❌ Failed to bring node healthy. Showing recent logs:"
+journalctl -u "${UNIT_NAME}" --no-pager -n 160 || true
+
+# ensure postgres is restored to avoid leaving system DB down
+restore_postgres_if_needed
+
+exit 1
