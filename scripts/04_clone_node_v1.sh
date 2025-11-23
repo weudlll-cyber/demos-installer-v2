@@ -1,19 +1,18 @@
 #!/bin/bash
 # [04] Clone Demos Node repository and install dependencies (auto-fix Bun untrusted packages)
 # - Idempotent clone into /opt/demos-node
-# - Uses a stable bun binary (/usr/local/bin/bun) for non-interactive contexts
-# - Auto-installs pnpm if required by package preinstall scripts
-# - Runs bun pm trust --all, bun install, and bun rebuild in a retry loop
+# - Ensures Node/npm or Corepack available so pnpm can be installed
+# - Installs pnpm robustly (corepack -> npm -g -> pnpm install script)
+# - Runs an initial pnpm install pass, then bun trust/install/rebuild loop
 # - Logs detailed bun activity to /var/log/demos-node-bun.log
-# - Writes a step marker so re-runs are safe and fast
 set -euo pipefail
 IFS=$'\n\t'
 
 # ---------- header ----------
 echo -e "\e[91m🔧 [04] Cloning Demos Node repository and installing dependencies...\e[0m"
-echo -e "\e[91mThis step sets up the node codebase in /opt/demos-node and ensures Bun deps are installed and trusted.\e[0m"
+echo -e "\e[91mThis step sets up /opt/demos-node and makes sure pnpm/bun deps run their lifecycle scripts.\e[0m"
 
-# ---------- markers (idempotency) ----------
+# ---------- markers ----------
 MARKER_DIR="/root/.demos_node_setup"
 STEP_MARKER="$MARKER_DIR/04_clone_repo.done"
 mkdir -p "$MARKER_DIR"
@@ -23,9 +22,7 @@ if [ -f "$STEP_MARKER" ]; then
   exit 0
 fi
 
-# ---------- resolve bun binary for non-interactive contexts ----------
-# Prefer global symlink at /usr/local/bin/bun, fallback to any available bun binary,
-# create symlink if bun is installed under /root/.bun but not globally linked.
+# ---------- resolve bun binary ----------
 if command -v /usr/local/bin/bun &>/dev/null; then
   BUN_BIN="/usr/local/bin/bun"
 elif command -v bun &>/dev/null; then
@@ -34,12 +31,9 @@ elif [ -x "/root/.bun/bin/bun" ]; then
   ln -sf /root/.bun/bin/bun /usr/local/bin/bun
   BUN_BIN="/usr/local/bin/bun"
 else
-  echo -e "\e[91m❌ Bun is not available in PATH. Ensure step 03 completed successfully.\e[0m"
-  echo -e "\e[91mRun the installer again once Bun is installed:\e[0m"
-  echo -e "\e[91msudo bash demos_node_setup_v1.sh\e[0m"
+  echo -e "\e[91m❌ Bun not found. Ensure step 03 completed successfully.\e[0m"
   exit 1
 fi
-
 export BUN_BIN
 export PATH="$(dirname "$BUN_BIN"):$PATH"
 echo -e "\e[93m🔍 Using bun binary: $BUN_BIN\e[0m"
@@ -47,75 +41,108 @@ echo -e "\e[93m🔍 Using bun binary: $BUN_BIN\e[0m"
 # ---------- repo settings ----------
 REPO_URL="https://github.com/kynesyslabs/node.git"
 TARGET_DIR="/opt/demos-node"
-
-# ---------- clone repository (idempotent; keep current branch synced) ----------
-echo -e "\e[93m📥 Cloning or updating Demos Node repository into $TARGET_DIR...\e[0m"
-if [ -d "${TARGET_DIR}/.git" ]; then
-  echo -e "\e[93m⚠️ Repository exists at ${TARGET_DIR}. Fetching and resetting to remote HEAD.\e[0m"
-  cd "$TARGET_DIR"
-  git fetch --all --tags --prune >> /var/log/git-demos-node.log 2>&1 || true
-  # Try to reset to remote HEAD; do not fail the entire script on non-critical git issues
-  git reset --hard origin/HEAD >> /var/log/git-demos-node.log 2>&1 || true
-else
-  rm -rf "$TARGET_DIR" 2>/dev/null || true
-  if ! git clone "$REPO_URL" "$TARGET_DIR" >> /var/log/git-demos-node.log 2>&1; then
-    echo -e "\e[91m❌ Git clone failed. Check network/GitHub access and retry.\e[0m"
-    echo -e "\e[91mSee /var/log/git-demos-node.log for details.\e[0m"
-    exit 1
-  fi
-fi
-
-# ---------- prepare bun log (detailed) ----------
 BUN_LOG="/var/log/demos-node-bun.log"
 mkdir -p "$(dirname "$BUN_LOG")"
 : > "$BUN_LOG"
 
-# ---------- install dependencies with bun (initial attempt) ----------
-echo -e "\e[93m📦 Installing dependencies with Bun (initial attempt)...\e[0m"
+# ---------- clone or update repository ----------
+echo -e "\e[93m📥 Cloning or updating repository into $TARGET_DIR...\e[0m"
+if [ -d "${TARGET_DIR}/.git" ]; then
+  cd "$TARGET_DIR"
+  git fetch --all --tags --prune >> /var/log/git-demos-node.log 2>&1 || true
+  git reset --hard origin/HEAD >> /var/log/git-demos-node.log 2>&1 || true
+else
+  rm -rf "$TARGET_DIR" 2>/dev/null || true
+  if ! git clone "$REPO_URL" "$TARGET_DIR" >> /var/log/git-demos-node.log 2>&1; then
+    echo -e "\e[91m❌ Git clone failed. See /var/log/git-demos-node.log\e[0m"
+    exit 1
+  fi
+fi
+
 cd "$TARGET_DIR"
 
-if [ -f "bun.lockb" ] || [ -f "package.json" ]; then
-  if ! "$BUN_BIN" install >> "$BUN_LOG" 2>&1; then
-    echo -e "\e[93m⚠️ bun install initially failed. Cleaning bun cache and retrying...\e[0m"
-    "$BUN_BIN" cache clean 2>/dev/null || true
-    if ! "$BUN_BIN" install >> "$BUN_LOG" 2>&1; then
-      echo -e "\e[91m❌ bun install failed after retry. Inspect $BUN_LOG and re-run the installer.\e[0m"
-      exit 1
+# ---------- ensure Node/npm or Corepack available for pnpm ----------
+# Some package preinstalls call pnpm. If npm/corepack/pnpm are missing, install them.
+ensure_node_and_pnpm() {
+  # If pnpm already available, nothing to do
+  if command -v pnpm &>/dev/null; then
+    echo -e "\e[92m✅ pnpm already available: $(command -v pnpm)\e[0m"
+    return 0
+  fi
+
+  echo -e "\e[93m🔧 Ensuring Node/npm or Corepack is installed so pnpm can be installed...\e[0m"
+
+  # 1) Try corepack (bundled with Node >=16.13 but disabled by default on some installs)
+  if command -v corepack &>/dev/null; then
+    echo -e "\e[93mℹ️ corepack present — enabling pnpm via corepack...\e[0m"
+    corepack enable 2>> "$BUN_LOG" || true
+    corepack prepare pnpm@latest --activate 2>> "$BUN_LOG" || true
+    if command -v pnpm &>/dev/null; then
+      echo -e "\e[92m✅ pnpm installed via corepack: $(command -v pnpm)\e[0m"
+      return 0
     fi
   fi
-else
-  echo -e "\e[93m⚠️ No bun.lockb or package.json found in repo; skipping dependency install.\e[0m"
-fi
 
-# ---------- ensure pnpm present early ----------
-# Some packages run pnpm in preinstall; install pnpm so those scripts can run
-echo -e "\e[93m🔧 Ensuring pnpm is available (some packages expect pnpm in lifecycle scripts)...\e[0m"
-if ! command -v pnpm &>/dev/null; then
-  # Use npm to install pnpm globally; tolerant to failure but check after
-  npm install -g pnpm >> "$BUN_LOG" 2>&1 || true
-fi
-if command -v pnpm &>/dev/null; then
-  echo -e "\e[92m✅ pnpm available at: $(command -v pnpm)\e[0m"
-else
-  echo -e "\e[93m⚠️ pnpm not available after attempted install. pnpm-dependent preinstall scripts may fail.\e[0m"
-fi
+  # 2) If npm available, install pnpm globally
+  if command -v npm &>/dev/null; then
+    echo -e "\e[93mℹ️ npm available — installing pnpm globally via npm...\e[0m"
+    npm install -g pnpm >> "$BUN_LOG" 2>&1 || true
+    if command -v pnpm &>/dev/null; then
+      echo -e "\e[92m✅ pnpm installed via npm: $(command -v pnpm)\e[0m"
+      return 0
+    fi
+  fi
 
-# ---------- run a pnpm pass to satisfy pnpm-specific preinstalls (non-fatal) ----------
+  # 3) If neither corepack nor npm existed, install Node.js (NodeSource LTS) to get npm
+  if ! command -v node &>/dev/null || ! command -v npm &>/dev/null; then
+    echo -e "\e[93mℹ️ Node/npm missing — installing Node.js 18 LTS via NodeSource (non-interactive)...\e[0m"
+    curl -fsSL https://deb.nodesource.com/setup_18.x | bash - >> "$BUN_LOG" 2>&1 || true
+    apt-get install -y nodejs >> "$BUN_LOG" 2>&1 || true
+    # verify npm now present
+    if command -v npm &>/dev/null; then
+      echo -e "\e[92m✅ node/npm installed: $(node --version) $(npm --version)\e[0m"
+      npm install -g pnpm >> "$BUN_LOG" 2>&1 || true
+      if command -v pnpm &>/dev/null; then
+        echo -e "\e[92m✅ pnpm installed via npm after Node install: $(command -v pnpm)\e[0m"
+        return 0
+      fi
+    else
+      echo -e "\e[93m⚠️ Node/npm install failed; pnpm may not be available. See $BUN_LOG\e[0m"
+    fi
+  fi
+
+  # 4) fallback: pnpm standalone installer (official script)
+  echo -e "\e[93mℹ️ Attempting pnpm standalone installer as fallback...\e[0m"
+  curl -fsSL https://get.pnpm.io/install.sh | env PNPM_HOME=/usr/local pnpm=true bash >> "$BUN_LOG" 2>&1 || true
+  # add /usr/local/bin to PATH if necessary (should be already)
+  if command -v pnpm &>/dev/null; then
+    echo -e "\e[92m✅ pnpm installed via fallback: $(command -v pnpm)\e[0m"
+    return 0
+  fi
+
+  # If we reach here, pnpm couldn't be installed automatically
+  echo -e "\e[93m⚠️ Could not install pnpm automatically. Some package preinstalls may fail. Check $BUN_LOG\e[0m"
+  return 1
+}
+
+ensure_node_and_pnpm >> "$BUN_LOG" 2>&1 || true
+
+# ---------- run a pnpm install pass if pnpm present (to satisfy pnpm-based preinstalls) ----------
 if [ -f "package.json" ] && command -v pnpm &>/dev/null; then
-  echo -e "\e[93m📦 Running pnpm install to allow pnpm-based preinstalls to complete...\e[0m"
-  # ignore-scripts=false => allow preinstall / postinstall scripts run by pnpm
+  echo -e "\e[93m📦 Running pnpm install to satisfy pnpm-based preinstall hooks...\e[0m"
   pnpm install --ignore-scripts=false >> "$BUN_LOG" 2>&1 || true
+else
+  echo -e "\e[93mℹ️ Skipping pnpm pass (package.json missing or pnpm not available)\e[0m"
+fi
+
+# ---------- initial bun install (already done earlier or now) ----------
+echo -e "\e[93m📦 Ensuring bun install has been run (post-pnpm)...\e[0m"
+if [ -f "bun.lockb" ] || [ -f "package.json" ]; then
+  "$BUN_BIN" install >> "$BUN_LOG" 2>&1 || true
 fi
 
 # ---------- automated trust / postinstall repair loop ----------
-# This loop attempts to resolve blocked lifecycle scripts automatically:
-# - bun pm trust --all
-# - bun install
-# - bun rebuild (if available)
-# - pnpm install if pnpm is present and further preinstalls needed
-# Loop until pm untrusted is empty or attempts exhausted.
 echo -e "\e[93m🔐 Ensuring Bun packages are trusted and postinstalls have run (logs: $BUN_LOG)...\e[0m"
-
 MAX_ATTEMPTS=4
 attempt=0
 while [ "$attempt" -lt "$MAX_ATTEMPTS" ]; do
@@ -138,25 +165,23 @@ while [ "$attempt" -lt "$MAX_ATTEMPTS" ]; do
     "$BUN_BIN" rebuild || true
   } >> "$BUN_LOG" 2>&1 || true
 
-  # Success condition: no untrusted packages reported
+  # success if no blocked packages remain
   if ! "$BUN_BIN" pm untrusted | grep -q '.'; then
     echo -e "\e[92m✅ Bun packages trusted and postinstalls attempted (attempt $attempt).\e[0m"
     break
   fi
 
-  # If still untrusted and pnpm exists, attempt pnpm install to satisfy pnpm-specific preinstalls
+  # if still untrusted and pnpm exists, do another pnpm pass
   if command -v pnpm &>/dev/null; then
-    echo -e "\e[93mℹ️ Untrusted packages remain; running pnpm install to satisfy pnpm-based scripts (attempt $attempt)...\e[0m"
+    echo -e "\e[93mℹ️ Untrusted packages remain; re-running pnpm install (attempt $attempt)...\e[0m"
     pnpm install --ignore-scripts=false >> "$BUN_LOG" 2>&1 || true
-  else
-    echo -e "\e[93mℹ️ pnpm not available; skipping pnpm attempt (attempt $attempt).\e[0m"
   fi
 
   echo -e "\e[93m⚠️ Some packages remain untrusted after attempt $attempt. Retrying after backoff...\e[0m"
   sleep $((attempt * 2))
 done
 
-# ---------- final best-effort trust if still blocked ----------
+# ---------- final best-effort ----------
 if "$BUN_BIN" pm untrusted | grep -q '.'; then
   echo -e "\e[93m⚠️ bun pm untrusted still reports blocked packages after $MAX_ATTEMPTS attempts.\e[0m"
   echo -e "\e[93mAttempting a final 'bun pm trust --all' and 'bun install' then proceeding; inspect $BUN_LOG for details.\e[0m"
@@ -166,17 +191,17 @@ else
   echo -e "\e[92m✅ Bun dependency trust and postinstall sequence completed successfully.\e[0m"
 fi
 
-# ---------- verify the run script exists and mark step complete ----------
+# ---------- verify run script ----------
 if [ -f "${TARGET_DIR}/run" ]; then
   echo -e "\e[92m✅ Node repository is ready (run script present).\e[0m"
   touch "$STEP_MARKER"
 else
   echo -e "\e[91m❌ Missing run script in ${TARGET_DIR}. Aborting.\e[0m"
-  echo -e "\e[91mCheck manually: ls -l ${TARGET_DIR}/run\e[0m"
+  echo -e "\e[91mCheck: ls -l ${TARGET_DIR}/run\e[0m"
   exit 1
 fi
 
-# ---------- show short bun log tail for quick feedback ----------
+# ---------- show short bun log tail ----------
 echo -e "\e[93m🔎 bun log tail (last 40 lines):\e[0m"
 tail -n 40 "$BUN_LOG" 2>/dev/null || true
 
