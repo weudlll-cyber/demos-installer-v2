@@ -31,7 +31,7 @@ curl -fsSL "https://raw.githubusercontent.com/weudlll-cyber/demos-installer-v2/m
 
 Stop demos node and make a clone of it
 ```bash
-sudo bash -lc 'curl -fsSL "https://raw.githubusercontent.com/weudlll-cyber/demos-installer-v2/main/stop_demos_node_v1.sh" -o /tmp/stop_demos_node_v1.sh && chmod +x /tmp/stop_demos_node_v1.sh && /tmp/stop_demos_node_v1.sh'
+curl -fsSL "https://raw.githubusercontent.com/weudlll-cyber/demos-installer-v2/main/stop_demos_node_v1.sh" -o /tmp/stop_demos_node_v1.sh && chmod +x /temp/stop_demos_node_v1.sh && sudo /tmp/stop_demos_node_v1.sh
 ``` 
 
 
