@@ -1,9 +1,9 @@
 #!/bin/bash
-# restart_demos_node — compact, safe restart flow with red messages
+# restart_demos_node — node-first, safe restart flow with red messages
 # - Mask unit to avoid flapping
-# - Stop DB (compose if available, else stop container)
-# - Start DB and wait for local TCP readiness
-# - Unmask+start systemd unit and wait for HTTP /health
+# - Start node first
+# - If node needs DB and DB not reachable: start DB only if host port free
+# - Wait for DB TCP readiness, then probe node HTTP /health
 # - Restore unit enablement state
 set -euo pipefail
 IFS=$'\n\t'
@@ -12,7 +12,7 @@ UNIT="demos-node.service"
 ENV="/opt/demos-node/.env"
 NODE_PORT=53550
 DB_PORT=5332
-DB_WAIT=30    # seconds to wait for DB TCP
+DB_WAIT=30    # seconds to wait for DB TCP after attempting to start DB
 HTTP_WAIT=60  # seconds to wait for HTTP /health
 
 # small helpers (all messages printed in red)
@@ -61,31 +61,16 @@ PRE_ENABLED=0
 if systemctl is-enabled --quiet "${UNIT}" 2>/dev/null; then PRE_ENABLED=1; fi
 sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
 
-CID=$(detect_db_cid || true)
-if [ -n "$CID" ]; then
-  log "Found DB container ${CID} publishing ${DB_PORT}; attempting compose stop if available"
-  PROJECT=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}' "$CID" 2>/dev/null || true)
-  SERVICE_LABEL=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.service" }}' "$CID" 2>/dev/null || true)
-  if [ -n "$PROJECT" ] && [ -n "$SERVICE_LABEL" ] && command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1 2>/dev/null; then
-    sudo docker compose -p "$PROJECT" stop "$SERVICE_LABEL" || true
-    sudo docker compose -p "$PROJECT" start "$SERVICE_LABEL" || true
-  else
-    sudo docker update --restart=no "$CID" >/dev/null 2>&1 || true
-    sudo docker stop --time 10 "$CID" >/dev/null 2>&1 || true
-    sudo docker start "$CID" >/dev/null 2>&1 || true
-  fi
+# 1) Check whether host DB port is already bound. If bound, do NOT attempt to start DB later.
+if ss -ltnp | grep -qE ":${DB_PORT}"; then
+  log "Host port ${DB_PORT} is already bound — will NOT attempt to start DB container (to avoid conflicts)"
+  SKIP_DB_START=1
 else
-  log "No DB container publishing port ${DB_PORT} detected; skipping container ops"
+  SKIP_DB_START=0
 fi
 
-log "Waiting up to ${DB_WAIT}s for DB TCP on 127.0.0.1:${DB_PORT}"
-if ! wait_tcp "${DB_PORT}" "${DB_WAIT}"; then
-  err "DB not reachable on ${DB_PORT}; aborting and unmasking unit"
-  sudo systemctl unmask "${UNIT}" >/dev/null 2>&1 || true
-  exit 1
-fi
-
-log "Unmasking and starting ${UNIT}"
+# 2) Start the node service first (node-first policy)
+log "Unmasking and starting ${UNIT} (node-first)"
 sudo systemctl unmask "${UNIT}" >/dev/null 2>&1 || true
 sudo systemctl daemon-reload >/dev/null 2>&1 || true
 if ! sudo systemctl start "${UNIT}"; then
@@ -94,12 +79,97 @@ if ! sudo systemctl start "${UNIT}"; then
   exit 1
 fi
 
-log "Waiting for HTTP /health on port ${NODE_PORT} up to ${HTTP_WAIT}s"
-if ! http_probe "${HTTP_WAIT}"; then
-  err "Node did not respond to HTTP /health in time; re-masking unit"
-  journalctl -u "${UNIT}" --no-pager -n 120 || true
+# 3) Wait for node HTTP /health briefly to see if node is already healthy
+log "Waiting up to ${HTTP_WAIT}s for HTTP /health on port ${NODE_PORT}"
+if http_probe "${HTTP_WAIT}"; then
+  log "Node responded to /health — restore enablement and finish"
+  if [ "${PRE_ENABLED}" -eq 1 ]; then
+    log "Restoring enablement: enabling ${UNIT}"
+    sudo systemctl enable --now "${UNIT}" >/dev/null 2>&1 || true
+  else
+    log "Leaving ${UNIT} disabled (was disabled before)"
+  fi
+  log "Restart complete — node responsive"
+  exit 0
+fi
+
+# 4) Node did not become healthy. Probe DB reachability now.
+log "Node not healthy yet — checking DB reachability on 127.0.0.1:${DB_PORT}"
+if wait_tcp "${DB_PORT}" 1; then
+  log "DB already reachable on ${DB_PORT}; giving node a bit more time to become healthy"
+  # give node a short grace period to become healthy
+  if http_probe 15; then
+    log "Node became healthy after DB was reachable"
+    if [ "${PRE_ENABLED}" -eq 1 ]; then
+      log "Restoring enablement: enabling ${UNIT}"
+      sudo systemctl enable --now "${UNIT}" >/dev/null 2>&1 || true
+    fi
+    exit 0
+  fi
+  err "Node still not healthy despite DB reachable; check node logs: journalctl -u ${UNIT} -n 200"
   sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
   exit 1
+fi
+
+# 5) DB not reachable. If we previously detected host port bound, abort to avoid conflicts.
+if [ "${SKIP_DB_START}" -eq 1 ]; then
+  err "DB not reachable on ${DB_PORT} and host port ${DB_PORT} is in use. Aborting and leaving node masked for operator investigation."
+  sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
+  exit 2
+fi
+
+# 6) DB not reachable and host port free — attempt to start DB container (compose preferred)
+log "DB not reachable and host port free — attempting to start DB container (compose preferred)"
+CID=$(detect_db_cid || true)
+if [ -n "$CID" ]; then
+  PROJECT=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}' "$CID" 2>/dev/null || true)
+  SERVICE_LABEL=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.service" }}' "$CID" 2>/dev/null || true)
+  if [ -n "$PROJECT" ] && [ -n "$SERVICE_LABEL" ] && command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1 2>/dev/null; then
+    log "Using docker compose for project ${PROJECT}, service ${SERVICE_LABEL}"
+    (cd "/opt/demos-node/${PROJECT}" 2>/dev/null || true)
+    sudo docker compose -p "$PROJECT" up -d "$SERVICE_LABEL" || sudo docker compose -p "$PROJECT" up -d || true
+  else
+    # try to start the container by name if present, else try to start any container with compose dir
+    if [ -n "$CID" ]; then
+      sudo docker update --restart=no "$CID" >/dev/null 2>&1 || true
+      sudo docker start "$CID" >/dev/null 2>&1 || true
+    else
+      # fallback: try to start a container named postgres_5332
+      sudo docker start postgres_5332 >/dev/null 2>&1 || true
+    fi
+  fi
+else
+  # no container currently publishing DB_PORT; try compose dir if present
+  if [ -d /opt/demos-node/postgres_5332 ] && command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1 2>/dev/null; then
+    log "No running DB container found; using docker compose in /opt/demos-node/postgres_5332 to start DB"
+    sudo bash -lc 'cd /opt/demos-node/postgres_5332 && docker compose up -d' || true
+  else
+    err "No DB container found and no compose project available to start DB. Aborting."
+    sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
+    exit 3
+  fi
+fi
+
+# 7) Wait for DB to accept TCP connections
+log "Waiting up to ${DB_WAIT}s for DB TCP on 127.0.0.1:${DB_PORT}"
+if ! wait_tcp "${DB_PORT}" "${DB_WAIT}"; then
+  err "DB did not become reachable within ${DB_WAIT}s. Check DB container logs and node logs."
+  if command -v docker >/dev/null 2>&1; then
+    log "Recent DB container logs (tail 200):"
+    docker ps -a --filter name=postgres_5332 --format '{{.ID}}' | xargs -r -I{} sudo docker logs --tail 200 {} || true
+  fi
+  journalctl -u "${UNIT}" --no-pager -n 120 || true
+  sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
+  exit 4
+fi
+
+# 8) DB reachable — wait a short moment and probe node HTTP /health again
+log "DB reachable — giving node ${HTTP_WAIT}s to become healthy"
+if ! http_probe "${HTTP_WAIT}"; then
+  err "Node did not respond to HTTP /health after DB became reachable; check node logs"
+  journalctl -u "${UNIT}" --no-pager -n 200 || true
+  sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
+  exit 5
 fi
 
 # restore enablement to previous state
