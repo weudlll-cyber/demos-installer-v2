@@ -1,58 +1,46 @@
 #!/bin/bash
 # stop_demos_node_v1.sh
-# - If demos-node.service is not running, exit (no stop, no clone)
-# - If running: mask unit, stop service, stop DB container(s), wait for ports free, clone /opt/demos-node
+# - If demos-node.service is not running, exit immediately
+# - If running: mask unit, stop service, disable+stop DB container(s), wait for ports to free
 set -euo pipefail
 IFS=$'\n\t'
 
 UNIT="demos-node.service"
-NODE_DIR="/opt/demos-node"
-CLONE_BASE="/opt"
 DB_PORT=5332
 NODE_PORT=53550
-TIMESTAMP="$(date +%Y%m%dT%H%M%S)"
-CLONE_DIR="${CLONE_BASE}/demos-node.clone.${TIMESTAMP}"
 WAIT_STOP=20
 WAIT_PORT=30
 
-# red output helpers
 info(){ printf "\e[91m%s\e[0m\n" "$*"; }
 err(){ printf "\e[91m%s\e[0m\n" "$*" >&2; }
 
-# require root
 if [ "$(id -u)" -ne 0 ]; then
   err "This script must be run as root (sudo)."
   exit 1
 fi
 
-# sanity check node dir
-if [ ! -d "$NODE_DIR" ]; then
-  err "Node directory not found at $NODE_DIR. Aborting."
-  exit 1
-fi
-
-# 0) Check whether the service is running; if not, skip stop+clone
-if systemctl list-unit-files --type=service --all | grep -q "^${UNIT}"; then
-  if systemctl is-active --quiet "${UNIT}"; then
-    info "${UNIT} is currently running — proceeding to stop and clone."
-  else
-    info "${UNIT} is not running — nothing to stop or clone. Exiting."
-    exit 0
-  fi
-else
-  info "Unit ${UNIT} not found. Nothing to stop; exiting."
+# Check service existence and active state
+if ! systemctl list-unit-files --type=service --all | grep -q "^${UNIT}"; then
+  info "Unit ${UNIT} not found. Nothing to stop. Exiting."
   exit 0
 fi
 
-# record previous enablement state
+if ! systemctl is-active --quiet "${UNIT}"; then
+  info "${UNIT} is not running. No stop or clone required. Exiting."
+  exit 0
+fi
+
+info "${UNIT} is running. Proceeding to mask and stop."
+
+# Record previous enablement state for operator awareness
 PRE_ENABLED=0
 if systemctl is-enabled --quiet "${UNIT}" 2>/dev/null; then PRE_ENABLED=1; fi
 
-# 1) Mask the unit to prevent automated restarts
+# Mask to prevent automated restarts
 info "Masking ${UNIT} to prevent automated restarts"
 systemctl mask "${UNIT}" >/dev/null 2>&1 || true
 
-# 2) Stop the service gracefully
+# Stop the service gracefully
 info "Stopping ${UNIT} (waiting up to ${WAIT_STOP}s)"
 systemctl stop "${UNIT}" || info "systemctl stop returned non-zero; continuing"
 for i in $(seq 1 $WAIT_STOP); do
@@ -70,7 +58,7 @@ if [ -n "$PID" ] && [ "$PID" != "0" ]; then
   sleep 1
 fi
 
-# 3) Detect Docker container(s) publishing DB_PORT and disable restart + stop them
+# Detect Docker container(s) publishing DB_PORT and disable restart + stop them
 detect_db_cids(){
   command -v docker >/dev/null 2>&1 || return 1
   docker ps --format '{{.ID}}\t{{.Ports}}\t{{.Names}}' | awk -v p=":${DB_PORT}->" '$0 ~ p { print $1 }'
@@ -88,47 +76,27 @@ else
   info "No container publishing host port ${DB_PORT} detected; skipping container stop."
 fi
 
-# 4) Wait for host ports to free (docker-proxy should exit)
+# Wait for host ports to free
 info "Waiting up to ${WAIT_PORT}s for host ports ${DB_PORT} and ${NODE_PORT} to be free"
 for i in $(seq 1 $WAIT_PORT); do
   ss -ltnp | grep -E ":${DB_PORT}|:${NODE_PORT}" >/dev/null || break
   sleep 1
 done
 
-# show final socket state
-info "Listening sockets (ports ${DB_PORT} and ${NODE_PORT}):"
+info "Listening sockets for ${DB_PORT} and ${NODE_PORT}:"
 ss -ltnp | grep -E ":${DB_PORT}|:${NODE_PORT}" || info "none — ports appear free"
 
-# 5) Create a clone of the node directory
-info "Creating clone of ${NODE_DIR} at ${CLONE_DIR} (preserves ownership and permissions)"
-if command -v rsync >/dev/null 2>&1; then
-  rsync -aHAX --numeric-ids --exclude 'node_modules' "$NODE_DIR/" "$CLONE_DIR/" || {
-    err "rsync failed while cloning; aborting clone step."
-    exit 1
-  }
-else
-  cp -a "$NODE_DIR" "$CLONE_DIR" || {
-    err "cp -a failed while cloning; aborting clone step."
-    exit 1
-  }
+# Final summary and guidance
+info "Stop sequence complete. Service ${UNIT} is masked and stopped."
+if [ -n "$CIDS" ]; then
+  echo "$CIDS" | while read -r cid; do
+    info "To restore Docker restart policy for container ${cid}, run:"
+    info "  sudo docker update --restart=unless-stopped ${cid}"
+  done
 fi
-
-# 6) Summary and next steps
-if [ -d "$CLONE_DIR" ]; then
-  info "Clone completed: ${CLONE_DIR}"
-  if [ -n "$CIDS" ]; then
-    echo "$CIDS" | while read -r cid; do
-      info "To restore Docker restart policy for container ${cid}, run:"
-      info "  sudo docker update --restart=unless-stopped ${cid}"
-    done
-  fi
-  if [ "${PRE_ENABLED}" -eq 1 ]; then
-    info "Note: the unit was enabled before masking. After unmasking you may want to re-enable it:"
-    info "  sudo systemctl enable --now ${UNIT}"
-  fi
-else
-  err "Clone directory not found after copy; something went wrong."
-  exit 1
+if [ "${PRE_ENABLED}" -eq 1 ]; then
+  info "Note the unit was enabled before masking. After unmasking you may want to re-enable it:"
+  info "  sudo systemctl enable --now ${UNIT}"
 fi
 
 exit 0
