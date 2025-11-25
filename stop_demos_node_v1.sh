@@ -1,10 +1,7 @@
 #!/bin/bash
 # stop_demos_node_v1.sh
-# - Mask demos-node.service to prevent automated restarts
-# - Stop the demos-node.service (graceful stop)
-# - Detect container(s) publishing DB port, set restart=no and stop them
-# - Wait for host ports to be freed (docker-proxy exit)
-# - Create a timestamped clone of /opt/demos-node
+# - If demos-node.service is not running, exit (no stop, no clone)
+# - If running: mask unit, stop service, stop DB container(s), wait for ports free, clone /opt/demos-node
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -15,8 +12,8 @@ DB_PORT=5332
 NODE_PORT=53550
 TIMESTAMP="$(date +%Y%m%dT%H%M%S)"
 CLONE_DIR="${CLONE_BASE}/demos-node.clone.${TIMESTAMP}"
-WAIT_STOP=20    # seconds to wait for service stop
-WAIT_PORT=30    # seconds to wait for ports to free
+WAIT_STOP=20
+WAIT_PORT=30
 
 # red output helpers
 info(){ printf "\e[91m%s\e[0m\n" "$*"; }
@@ -34,11 +31,22 @@ if [ ! -d "$NODE_DIR" ]; then
   exit 1
 fi
 
+# 0) Check whether the service is running; if not, skip stop+clone
+if systemctl list-unit-files --type=service --all | grep -q "^${UNIT}"; then
+  if systemctl is-active --quiet "${UNIT}"; then
+    info "${UNIT} is currently running — proceeding to stop and clone."
+  else
+    info "${UNIT} is not running — nothing to stop or clone. Exiting."
+    exit 0
+  fi
+else
+  info "Unit ${UNIT} not found. Nothing to stop; exiting."
+  exit 0
+fi
+
 # record previous enablement state
 PRE_ENABLED=0
-if systemctl list-unit-files --type=service --all | grep -q "^${UNIT}"; then
-  if systemctl is-enabled --quiet "${UNIT}" 2>/dev/null; then PRE_ENABLED=1; fi
-fi
+if systemctl is-enabled --quiet "${UNIT}" 2>/dev/null; then PRE_ENABLED=1; fi
 
 # 1) Mask the unit to prevent automated restarts
 info "Masking ${UNIT} to prevent automated restarts"
@@ -46,24 +54,20 @@ systemctl mask "${UNIT}" >/dev/null 2>&1 || true
 
 # 2) Stop the service gracefully
 info "Stopping ${UNIT} (waiting up to ${WAIT_STOP}s)"
-if systemctl list-unit-files --type=service --all | grep -q "^${UNIT}"; then
-  systemctl stop "${UNIT}" || info "systemctl stop returned non-zero; continuing"
-  for i in $(seq 1 $WAIT_STOP); do
-    PID=$(systemctl show -p MainPID --value "${UNIT}" 2>/dev/null || echo 0)
-    if [ -z "$PID" ] || [ "$PID" = "0" ]; then
-      info "${UNIT} stopped."
-      break
-    fi
-    sleep 1
-  done
+systemctl stop "${UNIT}" || info "systemctl stop returned non-zero; continuing"
+for i in $(seq 1 $WAIT_STOP); do
   PID=$(systemctl show -p MainPID --value "${UNIT}" 2>/dev/null || echo 0)
-  if [ -n "$PID" ] && [ "$PID" != "0" ]; then
-    err "Service did not exit within ${WAIT_STOP}s (MainPID=${PID}). Attempting to kill PID."
-    kill "$PID" 2>/dev/null || true
-    sleep 1
+  if [ -z "$PID" ] || [ "$PID" = "0" ]; then
+    info "${UNIT} stopped."
+    break
   fi
-else
-  info "Unit ${UNIT} not found; skipping systemd stop."
+  sleep 1
+done
+PID=$(systemctl show -p MainPID --value "${UNIT}" 2>/dev/null || echo 0)
+if [ -n "$PID" ] && [ "$PID" != "0" ]; then
+  err "Service did not exit within ${WAIT_STOP}s (MainPID=${PID}). Attempting to kill PID."
+  kill "$PID" 2>/dev/null || true
+  sleep 1
 fi
 
 # 3) Detect Docker container(s) publishing DB_PORT and disable restart + stop them
@@ -92,7 +96,7 @@ for i in $(seq 1 $WAIT_PORT); do
 done
 
 # show final socket state
-info "Listening sockets (5332 and 53550):"
+info "Listening sockets (ports ${DB_PORT} and ${NODE_PORT}):"
 ss -ltnp | grep -E ":${DB_PORT}|:${NODE_PORT}" || info "none — ports appear free"
 
 # 5) Create a clone of the node directory
@@ -112,7 +116,6 @@ fi
 # 6) Summary and next steps
 if [ -d "$CLONE_DIR" ]; then
   info "Clone completed: ${CLONE_DIR}"
-  info "Service ${UNIT} is masked and stopped."
   if [ -n "$CIDS" ]; then
     echo "$CIDS" | while read -r cid; do
       info "To restore Docker restart policy for container ${cid}, run:"
