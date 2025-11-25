@@ -29,7 +29,10 @@ Update the Helper Tools
 curl -fsSL "https://raw.githubusercontent.com/weudlll-cyber/demos-installer-v2/main/update_helpers_v1.sh" -o /tmp/update_helpers_v1.sh && chmod +x /tmp/update_helpers_v1.sh && sudo /tmp/update_helpers_v1.sh
 ```
 
-
+Stop demos node and make a clone of it
+```bash
+sudo bash -lc 'curl -fsSL "https://raw.githubusercontent.com/weudlll-cyber/demos-installer-v2/main/stop_demos_node_v1.sh" -o /tmp/stop_demos_node_v1.sh && chmod +x /tmp/stop_demos_node_v1.sh && /tmp/stop_demos_node_v1.sh'
+``` 
 
 
 💡 The installer will automatically reboot once to finalize system upgrades.
