@@ -5,7 +5,7 @@
 # - If node needs DB and DB not reachable: start DB only if host port free
 # - Wait for DB TCP readiness, then probe node HTTP /health
 # - Restore unit enablement state
-# - Extra safety: robust docker checks, conservative container cleanup, clear exit codes
+# - Extra diagnostics printed at multiple points for troubleshooting
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -30,8 +30,7 @@ fi
 # prefer docker-compose stop/start when we can detect the DB container publishing DB_PORT
 detect_db_cid(){
   command -v docker >/dev/null 2>&1 || return 0
-  # prefer container publishing the host DB_PORT
-  docker ps --format '{{.ID}}\t{{.Ports}}' | awk -v p=":${DB_PORT}->" '$0 ~ p { print $1; exit }'
+  docker ps --format '{{.ID}}\t{{.Names}}\t{{.Ports}}' | awk -v p=":${DB_PORT}->" '$0 ~ p { print $1; exit }'
 }
 
 wait_tcp(){
@@ -86,6 +85,30 @@ docker_force_remove(){
   return 0
 }
 
+# small diagnostic helper to print system and docker state
+print_diagnostics(){
+  log "=== DIAGNOSTICS BEGIN ==="
+  log "Systemd unit status for ${UNIT}:"
+  sudo systemctl status "${UNIT}" --no-pager -l || true
+  log "Recent journal lines for ${UNIT}:"
+  sudo journalctl -u "${UNIT}" --no-pager -n 80 || true
+  if docker_available; then
+    log "Docker: list all containers (ps -a):"
+    sudo docker ps -a --format 'ID={{.ID}} Name={{.Names}} Status={{.Status}} Ports={{.Ports}}' || true
+    if docker_container_exists "${DB_CONTAINER_NAME}"; then
+      log "Docker: inspect ${DB_CONTAINER_NAME}:"
+      sudo docker inspect --format 'Name: {{.Name}} ID: {{.Id}} State: {{.State.Status}} RestartCount: {{.RestartCount}}' "${DB_CONTAINER_NAME}" 2>/dev/null || true
+      log "Docker: last 200 lines of ${DB_CONTAINER_NAME} logs:"
+      sudo docker logs --tail 200 "${DB_CONTAINER_NAME}" || true
+    else
+      log "Docker: no container named ${DB_CONTAINER_NAME} found"
+    fi
+  else
+    log "Docker not available on this host"
+  fi
+  log "=== DIAGNOSTICS END ==="
+}
+
 # BEGIN restart flow
 log "Masking ${UNIT} to prevent automatic restarts while we operate"
 PRE_ENABLED=0
@@ -105,10 +128,17 @@ log "Unmasking and starting ${UNIT} (node-first)"
 sudo systemctl unmask "${UNIT}" >/dev/null 2>&1 || true
 sudo systemctl daemon-reload >/dev/null 2>&1 || true
 if ! sudo systemctl start "${UNIT}"; then
-  err "systemctl start failed; re-masking and aborting"
+  err "systemctl start failed; printing diagnostics and aborting"
+  print_diagnostics
   sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
   exit 1
 fi
+
+# show immediate status after start attempt
+log "systemctl status immediately after start attempt:"
+sudo systemctl status "${UNIT}" --no-pager -l || true
+log "tail of journal for ${UNIT} (last 40 lines):"
+sudo journalctl -u "${UNIT}" --no-pager -n 40 || true
 
 # 3) Wait for node HTTP /health briefly to see if node is already healthy
 log "Waiting up to ${HTTP_WAIT}s for HTTP /health on port ${NODE_PORT}"
@@ -137,7 +167,8 @@ if wait_tcp "${DB_PORT}" 1; then
     fi
     exit 0
   fi
-  err "Node still not healthy despite DB reachable; check node logs: journalctl -u ${UNIT} -n 200"
+  err "Node still not healthy despite DB reachable; printing diagnostics and aborting"
+  print_diagnostics
   sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
   exit 1
 fi
@@ -145,37 +176,43 @@ fi
 # 5) DB not reachable. If we previously detected host port bound, abort to avoid conflicts.
 if [ "${SKIP_DB_START}" -eq 1 ]; then
   err "DB not reachable on ${DB_PORT} and host port ${DB_PORT} is in use. Aborting and leaving node masked for operator investigation."
+  print_diagnostics
   sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
   exit 2
 fi
 
 # 5.5) Guard against container name conflicts while being conservative
 if docker_available; then
+  log "Detecting DB container publishing port: calling detect_db_cid()"
+  CID=$(detect_db_cid || true)
+  log "detect_db_cid returned: ${CID:-<none>}"
+
   if docker_container_exists "${DB_CONTAINER_NAME}"; then
     STATUS=$(docker_container_status "${DB_CONTAINER_NAME}" || true)
+    log "Found container ${DB_CONTAINER_NAME} with status '${STATUS}'"
     if [ "$STATUS" = "running" ]; then
       log "${DB_CONTAINER_NAME} is running — will attempt to reuse it (no removal)"
-      # ensure it's actually listening on DB_PORT; if not, we'll still try to start node and then handle
       if wait_tcp "${DB_PORT}" 1; then
         log "Container ${DB_CONTAINER_NAME} is listening on ${DB_PORT}"
       else
-        log "Container ${DB_CONTAINER_NAME} running but not listening on ${DB_PORT}; will attempt restart of container"
+        log "Container ${DB_CONTAINER_NAME} running but not listening on ${DB_PORT}; attempting restart"
         if ! sudo docker restart "${DB_CONTAINER_NAME}" >/dev/null 2>&1; then
           err "Failed to restart ${DB_CONTAINER_NAME}; attempting forced removal to allow recreate"
           if ! docker_force_remove "${DB_CONTAINER_NAME}"; then
-            err "Failed to remove ${DB_CONTAINER_NAME}; aborting to avoid name conflict"
+            err "Failed to remove ${DB_CONTAINER_NAME}; printing diagnostics and aborting"
+            print_diagnostics
             sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
             exit 6
           fi
         fi
       fi
     else
-      # container exists but not running; try to start it first (safe), if that fails remove it
       log "${DB_CONTAINER_NAME} exists with status '${STATUS}' — attempting to start it"
       if ! docker_try_start "${DB_CONTAINER_NAME}"; then
         log "Starting ${DB_CONTAINER_NAME} failed; removing stale container to allow fresh create"
         if ! docker_force_remove "${DB_CONTAINER_NAME}"; then
-          err "Failed to remove stale ${DB_CONTAINER_NAME}; aborting to avoid name conflict"
+          err "Failed to remove stale ${DB_CONTAINER_NAME}; printing diagnostics and aborting"
+          print_diagnostics
           sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
           exit 7
         fi
@@ -184,39 +221,49 @@ if docker_available; then
         sleep 2
       fi
     fi
+  else
+    log "No container named ${DB_CONTAINER_NAME} exists locally"
   fi
+else
+  log "Docker not available; will attempt other DB start methods if present"
+  CID=""
 fi
 
 # 6) DB not reachable and host port free — attempt to start DB container (compose preferred)
 log "DB not reachable and host port free — attempting to start DB container (compose preferred)"
-CID=$(detect_db_cid || true)
+CID=${CID:-$(detect_db_cid || true)}
+log "Using CID (if any): ${CID:-<none>}"
+
 if [ -n "$CID" ]; then
   PROJECT=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}' "$CID" 2>/dev/null || true)
   SERVICE_LABEL=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.service" }}' "$CID" 2>/dev/null || true)
+  log "docker inspect labels: project='${PROJECT}' service='${SERVICE_LABEL}'"
   if [ -n "$PROJECT" ] && [ -n "$SERVICE_LABEL" ] && docker_available && docker compose version >/dev/null 2>&1 2>/dev/null; then
     log "Using docker compose for project ${PROJECT}, service ${SERVICE_LABEL}"
-    # ensure we run compose from the project dir if it exists; otherwise run compose with -p
     if [ -d "/opt/demos-node/${PROJECT}" ]; then
+      log "Running: (cd /opt/demos-node/${PROJECT} && sudo docker compose -p ${PROJECT} up -d ${SERVICE_LABEL})"
       (cd "/opt/demos-node/${PROJECT}" 2>/dev/null || true; sudo docker compose -p "$PROJECT" up -d "$SERVICE_LABEL") || sudo docker compose -p "$PROJECT" up -d || true
     else
+      log "Running: sudo docker compose -p ${PROJECT} up -d ${SERVICE_LABEL}"
       sudo docker compose -p "$PROJECT" up -d "$SERVICE_LABEL" || sudo docker compose -p "$PROJECT" up -d || true
     fi
   else
     # try to start the container by ID if present, else try to start the named container
     if [ -n "$CID" ]; then
+      log "Attempting to start container ID ${CID}"
       sudo docker update --restart=no "$CID" >/dev/null 2>&1 || true
       sudo docker start "$CID" >/dev/null 2>&1 || true
     else
-      # fallback: try to start a container named postgres_5332
+      log "No CID found; attempting to start container named ${DB_CONTAINER_NAME} if present"
       if docker_available && docker_container_exists "${DB_CONTAINER_NAME}"; then
         sudo docker start "${DB_CONTAINER_NAME}" >/dev/null 2>&1 || true
       else
-        # try compose dir if present
         if [ -d /opt/demos-node/postgres_5332 ] && docker_available && docker compose version >/dev/null 2>&1 2>/dev/null; then
           log "No running DB container found; using docker compose in /opt/demos-node/postgres_5332 to start DB"
           sudo bash -lc 'cd /opt/demos-node/postgres_5332 && docker compose up -d' || true
         else
-          err "No DB container found and no compose project available to start DB. Aborting."
+          err "No DB container found and no compose project available to start DB. Printing diagnostics and aborting."
+          print_diagnostics
           sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
           exit 3
         fi
@@ -229,7 +276,8 @@ else
     log "No running DB container found; using docker compose in /opt/demos-node/postgres_5332 to start DB"
     sudo bash -lc 'cd /opt/demos-node/postgres_5332 && docker compose up -d' || true
   else
-    err "No DB container found and no compose project available to start DB. Aborting."
+    err "No DB container found and no compose project available to start DB. Printing diagnostics and aborting."
+    print_diagnostics
     sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
     exit 3
   fi
@@ -238,11 +286,8 @@ fi
 # 7) Wait for DB to accept TCP connections
 log "Waiting up to ${DB_WAIT}s for DB TCP on 127.0.0.1:${DB_PORT}"
 if ! wait_tcp "${DB_PORT}" "${DB_WAIT}"; then
-  err "DB did not become reachable within ${DB_WAIT}s. Check DB container logs and node logs."
-  if docker_available; then
-    log "Recent DB container logs (tail 200):"
-    docker ps -a --filter name="${DB_CONTAINER_NAME}" --format '{{.ID}}' | xargs -r -I{} sudo docker logs --tail 200 {} || true
-  fi
+  err "DB did not become reachable within ${DB_WAIT}s. Printing diagnostics."
+  print_diagnostics
   journalctl -u "${UNIT}" --no-pager -n 120 || true
   sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
   exit 4
@@ -251,7 +296,8 @@ fi
 # 8) DB reachable — wait a short moment and probe node HTTP /health again
 log "DB reachable — giving node ${HTTP_WAIT}s to become healthy"
 if ! http_probe "${HTTP_WAIT}"; then
-  err "Node did not respond to HTTP /health after DB became reachable; check node logs"
+  err "Node did not respond to HTTP /health after DB became reachable; printing diagnostics"
+  print_diagnostics
   journalctl -u "${UNIT}" --no-pager -n 200 || true
   sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
   exit 5
