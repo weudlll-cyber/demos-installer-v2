@@ -1,11 +1,12 @@
 #!/bin/bash
+# File: /opt/demos-node/helpers/restart_demos_node
 # restart_demos_node — node-first, safe restart flow with red messages
 # - Mask unit to avoid flapping
 # - Start node first
 # - If node needs DB and DB not reachable: start DB only if host port free
 # - Wait for DB TCP readiness, then probe node HTTP /health
 # - Restore unit enablement state
-# - Extra diagnostics printed at multiple points for troubleshooting
+# - Extra diagnostics and safer docker handling; conservative removal only when necessary
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -167,8 +168,7 @@ if wait_tcp "${DB_PORT}" 1; then
     fi
     exit 0
   fi
-  err "Node still not healthy despite DB reachable; printing diagnostics and aborting"
-  print_diagnostics
+  err "Node still not healthy despite DB reachable; check node logs: journalctl -u ${UNIT} -n 200"
   sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
   exit 1
 fi
@@ -262,8 +262,7 @@ if [ -n "$CID" ]; then
           log "No running DB container found; using docker compose in /opt/demos-node/postgres_5332 to start DB"
           sudo bash -lc 'cd /opt/demos-node/postgres_5332 && docker compose up -d' || true
         else
-          err "No DB container found and no compose project available to start DB. Printing diagnostics and aborting."
-          print_diagnostics
+          err "No DB container found and no compose project available to start DB. Aborting."
           sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
           exit 3
         fi
@@ -276,8 +275,7 @@ else
     log "No running DB container found; using docker compose in /opt/demos-node/postgres_5332 to start DB"
     sudo bash -lc 'cd /opt/demos-node/postgres_5332 && docker compose up -d' || true
   else
-    err "No DB container found and no compose project available to start DB. Printing diagnostics and aborting."
-    print_diagnostics
+    err "No DB container found and no compose project available to start DB. Aborting."
     sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
     exit 3
   fi
@@ -286,8 +284,11 @@ fi
 # 7) Wait for DB to accept TCP connections
 log "Waiting up to ${DB_WAIT}s for DB TCP on 127.0.0.1:${DB_PORT}"
 if ! wait_tcp "${DB_PORT}" "${DB_WAIT}"; then
-  err "DB did not become reachable within ${DB_WAIT}s. Printing diagnostics."
-  print_diagnostics
+  err "DB did not become reachable within ${DB_WAIT}s. Check DB container logs and node logs."
+  if docker_available; then
+    log "Recent DB container logs (tail 200):"
+    docker ps -a --filter name="${DB_CONTAINER_NAME}" --format '{{.ID}}' | xargs -r -I{} sudo docker logs --tail 200 {} || true
+  fi
   journalctl -u "${UNIT}" --no-pager -n 120 || true
   sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
   exit 4
@@ -296,8 +297,7 @@ fi
 # 8) DB reachable — wait a short moment and probe node HTTP /health again
 log "DB reachable — giving node ${HTTP_WAIT}s to become healthy"
 if ! http_probe "${HTTP_WAIT}"; then
-  err "Node did not respond to HTTP /health after DB became reachable; printing diagnostics"
-  print_diagnostics
+  err "Node did not respond to HTTP /health after DB became reachable; check node logs"
   journalctl -u "${UNIT}" --no-pager -n 200 || true
   sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
   exit 5
