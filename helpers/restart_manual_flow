@@ -1,0 +1,158 @@
+#!/bin/bash
+# File: demos-installer-v2/helpers/restart_manual_flow
+# Purpose:
+#   Stop all automation (systemd units we created), clear conflicting DB container state,
+#   and start the node strictly via the manual entrypoint (./run), so logs and the public key
+#   print to the terminal exactly as if you followed INSTALL.md by hand.
+#
+# Usage:
+#   sudo demos-installer-v2/helpers/restart_manual_flow
+#
+# Notes:
+#   - Does NOT modify keys or your .env; it only stops services and starts via ./run.
+#   - Press Ctrl+C to stop the live logs after starting.
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# -------------------------------------------------------------------
+# Configuration — update if your setup differs
+# -------------------------------------------------------------------
+
+# Path to the cloned node repository (should contain the manual ./run script).
+NODE_DIR="/opt/demos-node"
+
+# Systemd units we created for automation (adjust if you have more/less).
+UNITS=(
+  "demos-node.service"
+  "demos-node-timer.service"
+  "demos-node-maintenance.service"
+)
+
+# Name of the local Postgres container used by the node (keep name stable).
+DB_CONTAINER_NAME="postgres_5332"
+
+# Optional ports for info only (not required to run ./run).
+NODE_PORT="${NODE_PORT:-53550}"
+DB_PORT="${DB_PORT:-5332}"
+
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
+
+log(){ printf "\e[91m%s\e[0m\n" "$*"; }
+err(){ printf "\e[91m%s\e[0m\n" "$*" >&2; }
+
+# Check if a systemd unit file exists (recognized by systemd).
+exists_unit(){
+  systemctl list-unit-files | awk '{print $1}' | grep -qx "$1"
+}
+
+# Stop, disable, and mask a unit if present.
+stop_mask_unit(){
+  local unit="$1"
+  if exists_unit "$unit"; then
+    log "Stopping ${unit}"
+    sudo systemctl stop "$unit" >/dev/null 2>&1 || true
+    log "Disabling ${unit}"
+    sudo systemctl disable "$unit" >/dev/null 2>&1 || true
+    log "Masking ${unit} (prevent auto-start while we run manually)"
+    sudo systemctl mask "$unit" >/dev/null 2>&1 || true
+  else
+    log "Unit ${unit} not found — skipping"
+  fi
+}
+
+# Return the status of the DB container, or empty if it does not exist.
+db_container_status(){
+  command -v docker >/dev/null 2>&1 || return 1
+  docker ps -a --format '{{.Names}}' | grep -qx "$DB_CONTAINER_NAME" || return 1
+  docker inspect --format '{{.State.Status}}' "$DB_CONTAINER_NAME" 2>/dev/null || echo "unknown"
+}
+
+# Clean up the DB container if it exists; remove when not cleanly running.
+cleanup_db_container(){
+  if ! command -v docker >/dev/null 2>&1; then
+    log "Docker not available — skipping DB cleanup"
+    return 0
+  fi
+
+  local status
+  status=$(db_container_status || true)
+  if [ -z "$status" ]; then
+    log "No container named ${DB_CONTAINER_NAME} — nothing to clean"
+    return 0
+  fi
+
+  case "$status" in
+    running)
+      # For a pure manual flow, stop and remove so ./run (or repo compose) can recreate.
+      log "Stopping running DB container ${DB_CONTAINER_NAME}"
+      sudo docker stop "$DB_CONTAINER_NAME" >/dev/null 2>&1 || true
+      ;;
+    exited|dead|created|paused|removing|restarting|unknown)
+      log "Found ${DB_CONTAINER_NAME} in '${status}' state — removing stale container"
+      ;;
+    *)
+      log "Found ${DB_CONTAINER_NAME} with state '${status}' — removing to avoid conflicts"
+      ;;
+  esac
+
+  log "Removing DB container ${DB_CONTAINER_NAME}"
+  sudo docker rm "$DB_CONTAINER_NAME" >/dev/null 2>&1 || true
+}
+
+# Optional: simple TCP wait helper for informational checks.
+wait_tcp(){
+  local port="$1" timeout="${2:-30}" elapsed=0
+  while [ $elapsed -lt $timeout ]; do
+    if bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/${port}" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1; elapsed=$((elapsed+1))
+  done
+  return 1
+}
+
+# -------------------------------------------------------------------
+# Execution
+# -------------------------------------------------------------------
+
+# 1) Stop and mask automation units to avoid interference.
+log "Stopping and masking node-related systemd units (manual run will take over)"
+for u in "${UNITS[@]}"; do
+  stop_mask_unit "$u"
+done
+
+# 2) Systemd housekeeping.
+log "Reloading systemd daemon to reflect unit changes"
+sudo systemctl daemon-reload >/dev/null 2>&1 || true
+
+# 3) Clean DB container state so the manual run can recreate cleanly.
+log "Cleaning up DB container state (name: ${DB_CONTAINER_NAME})"
+cleanup_db_container
+
+# 4) Check repo directory and manual run script presence.
+if [ ! -d "$NODE_DIR" ]; then
+  err "Node directory not found at ${NODE_DIR}. Update NODE_DIR to your repo location."
+  err "Expected kynesyslabs/node (testnet) cloned at ${NODE_DIR}."
+  exit 1
+fi
+cd "$NODE_DIR"
+
+if [ ! -x "./run" ]; then
+  err "Missing or non-executable ./run script in ${NODE_DIR}."
+  err "Ensure the repo is correctly cloned/checked out and run: chmod +x ./run"
+  exit 2
+fi
+
+# 5) Informational pre-flight.
+log "Pre-flight info: NODE_PORT=${NODE_PORT}, DB_PORT=${DB_PORT}"
+if ss -ltnp | grep -qE ":${DB_PORT}"; then
+  log "Note: Host DB port ${DB_PORT} is already bound — manual ./run may reuse or recreate DB."
+fi
+
+# 6) Start strictly via the manual entrypoint. This will print the public key and live logs.
+log "Starting node via manual entrypoint: ./run"
+log "Logs and public key will print below; press Ctrl+C to stop"
+exec ./run
