@@ -118,6 +118,17 @@ if [ "${SKIP_DB_START}" -eq 1 ]; then
   exit 2
 fi
 
+# 5.5) If a postgres_5332 container exists but is exited, remove it to avoid conflicts; if running, reuse it
+if command -v docker >/dev/null 2>&1 && docker ps -a --format '{{.Names}}' | grep -q '^postgres_5332$'; then
+  STATUS=$(docker inspect --format '{{.State.Status}}' postgres_5332 2>/dev/null || true)
+  if [ "$STATUS" = "running" ]; then
+    log "postgres_5332 is already running — will reuse"
+  else
+    log "postgres_5332 exists but is $STATUS — removing to allow clean restart"
+    sudo docker rm postgres_5332 >/dev/null 2>&1 || true
+  fi
+fi
+
 # 6) DB not reachable and host port free — attempt to start DB container (compose preferred)
 log "DB not reachable and host port free — attempting to start DB container (compose preferred)"
 CID=$(detect_db_cid || true)
@@ -129,7 +140,7 @@ if [ -n "$CID" ]; then
     (cd "/opt/demos-node/${PROJECT}" 2>/dev/null || true)
     sudo docker compose -p "$PROJECT" up -d "$SERVICE_LABEL" || sudo docker compose -p "$PROJECT" up -d || true
   else
-    # try to start the container by name if present, else try to start any container with compose dir
+    # try to start the container by ID if present, else try to start the named container
     if [ -n "$CID" ]; then
       sudo docker update --restart=no "$CID" >/dev/null 2>&1 || true
       sudo docker start "$CID" >/dev/null 2>&1 || true
