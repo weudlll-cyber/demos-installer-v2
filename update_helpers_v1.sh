@@ -50,8 +50,20 @@ for fname in "${FILES[@]}"; do
   if curl -fsSL "${raw_url}" -o "${tmp_path}"; then
     chmod +x "${tmp_path}"
     mv -f "${tmp_path}" "${dst_path}"
-    ln -sf "${dst_path}" "${GLOBAL_BIN}/${safe_name%.*}" 2>/dev/null || ln -sf "${dst_path}" "${GLOBAL_BIN}/${safe_name}"
-    echo "Installed and linked: ${safe_name}"
+
+    # Symlink strategy:
+    # - For files with an extension (e.g., .sh), create a symlink without the extension.
+    # - For extensionless files (e.g., restart_manual_flow), link as-is.
+    base_no_ext="${safe_name%.*}"
+    link_target="${GLOBAL_BIN}/${base_no_ext}"
+
+    # If stripping yields the same name (i.e., no extension), link as-is.
+    if [ "${base_no_ext}" = "${safe_name}" ]; then
+      link_target="${GLOBAL_BIN}/${safe_name}"
+    fi
+
+    ln -sf "${dst_path}" "${link_target}"
+    echo "Installed and linked: ${safe_name} -> ${link_target}"
   else
     echo "Warning: failed to fetch ${raw_url}; skipping ${safe_name}."
     rm -f "${tmp_path}" || true
@@ -60,4 +72,15 @@ done
 
 echo "Helpers update finished. Installed files in ${HELPER_DIR} and symlinked to ${GLOBAL_BIN}."
 echo "Available helper commands (symlinks):"
-ls -l "${GLOBAL_BIN}" | egrep "$(printf '%s|' "${FILES[@]}" | sed 's/|$//; s/\.sh//g')" || true
+# List symlinks for detected files, showing both extensionless and stripped names
+for f in "${FILES[@]}"; do
+  bn="${f%.*}"
+  if [ "${bn}" = "${f}" ]; then
+    # extensionless
+    cmd="${f}"
+  else
+    # had an extension, we symlinked to the stripped name
+    cmd="${bn}"
+  fi
+  ls -l "${GLOBAL_BIN}/${cmd}" 2>/dev/null || true
+done
