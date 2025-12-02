@@ -1,20 +1,19 @@
 #!/usr/bin/env bash
 # restart_demos_node.sh
-# Combined stop -> start -> enable-autostart flow
-# - Cleanly stop node (systemd-managed or stray), remove unit files and drop-ins
-# - Stop/remove DB container(s) publishing DB_PORT and disable Docker autostart
-# - Start node now (same as manual ./run), wait for bind
+# Stop -> restart -> re-enable flow
+# - Cleanly stop node (systemd-managed or stray), disable/mask unit
+# - Stop/remove DB container(s) publishing DB_PORT
+# - Ensure dependencies are installed
+# - Restart node under systemd and wait for bind
 # - Wait for node-created Postgres container, set restart=unless-stopped
-# - Recreate minimal systemd unit for demos-node.service and enable it (does NOT start a second instance)
+# - Re-enable systemd unit for autostart
+
 set -euo pipefail
 IFS=$'\n\t'
 
 UNIT="demos-node.service"
 UNIT_PATH="/etc/systemd/system/${UNIT}"
-DROPIN_DIR="/etc/systemd/system/${UNIT}.d"
-NODE_RUN="/opt/demos-node/run"
 WORKDIR="/opt/demos-node"
-COMPOSE_DIR="/opt/demos-node/postgres_5332"
 DB_NAME_FILTER="postgres_5332"
 DB_PORT=5332
 NODE_PORT=53550
@@ -44,13 +43,6 @@ detect_db_cids(){
 # -------------------------
 info "STEP 1: Stopping node and cleaning systemd + Docker autostart"
 
-# If unit exists, record enabled state
-PRE_ENABLED=0
-if systemctl list-unit-files --type=service --all | grep -q "^${UNIT}"; then
-  if systemctl is-enabled --quiet "${UNIT}" 2>/dev/null; then PRE_ENABLED=1; fi
-fi
-
-# Stop unit if active
 if systemctl list-unit-files --type=service --all | grep -q "^${UNIT}"; then
   if systemctl is-active --quiet "${UNIT}"; then
     info "Stopping systemd unit ${UNIT}..."
@@ -66,19 +58,9 @@ else
   info "Systemd unit ${UNIT} not present."
 fi
 
-# Wait for systemd MainPID to exit (if any)
-for i in $(seq 1 $WAIT_STOP); do
-  PID=$(systemctl show -p MainPID --value "${UNIT}" 2>/dev/null || echo 0)
-  if [ -z "$PID" ] || [ "$PID" = "0" ]; then
-    break
-  fi
-  sleep 1
-done
-
-# Kill stray node processes (bun or run script)
+# Kill stray node processes
 info "Killing stray node processes (if any)..."
-STRAY_PIDS="$(pgrep -f 'bun -r tsconfig-paths/register src/index.ts' || true) $(pgrep -f '/opt/demos-node/run' || true) $(pgrep -f 'bun start:bun' || true)"
-STRAY_PIDS="$(echo "$STRAY_PIDS" | tr ' ' '\n' | awk 'NF' | sort -u || true)"
+STRAY_PIDS="$(pgrep -f '/opt/demos-node/run' || true)"
 if [ -n "$STRAY_PIDS" ]; then
   echo "$STRAY_PIDS" | while read -r p; do
     info "  - TERM $p"
@@ -95,19 +77,7 @@ else
   info "No stray node processes found."
 fi
 
-# Remove systemd unit file and drop-ins (complete cleanup)
-if [ -f "${UNIT_PATH}" ] || [ -d "${DROPIN_DIR}" ]; then
-  info "Removing systemd unit file and drop-ins for ${UNIT}"
-  rm -f "${UNIT_PATH}" || true
-  rm -rf "${DROPIN_DIR}" || true
-  systemctl daemon-reload || true
-  systemctl reset-failed || true
-  info "Systemd unit files removed and daemon reloaded."
-else
-  info "No unit file or drop-in directory to remove."
-fi
-
-# Detect and stop/remove DB container(s)
+# Stop/remove DB containers
 CIDS="$(detect_db_cids || true)"
 if [ -n "$CIDS" ]; then
   info "Found container(s) publishing host port ${DB_PORT}:"
@@ -121,54 +91,41 @@ else
   info "No container publishing host port ${DB_PORT} detected; skipping container stop/removal."
 fi
 
-# Wait for ports to free
-info "Waiting up to ${WAIT_STOP}s for node and DB ports to free..."
-for i in $(seq 1 $WAIT_STOP); do
-  if ! ss -ltnp | grep -E ":${DB_PORT}|:${NODE_PORT}" >/dev/null; then
+# -------------------------
+# 2) Ensure dependencies and restart node under systemd
+# -------------------------
+info "STEP 2: Ensuring dependencies and restarting node under systemd"
+
+if [ ! -f "${WORKDIR}/package.json" ]; then
+  err "Missing package.json in ${WORKDIR}. Cannot install dependencies or start node."
+  exit 5
+fi
+
+info "Running bun install in ${WORKDIR}..."
+cd "${WORKDIR}"
+bun install || { err "bun install failed"; exit 6; }
+
+info "Restarting systemd unit ${UNIT}..."
+systemctl unmask "${UNIT}" >/dev/null 2>&1 || true
+systemctl daemon-reload
+systemctl restart "${UNIT}"
+
+info "Waiting up to ${WAIT_BIND}s for node to bind ${NODE_PORT}..."
+for i in $(seq 1 ${WAIT_BIND}); do
+  if ss -ltnp | grep -q ":${NODE_PORT}"; then
+    info "Node is listening on ${NODE_PORT}."
     break
   fi
   sleep 1
 done
 
-info "Listening sockets for ${DB_PORT} and ${NODE_PORT}:"
-ss -ltnp | grep -E ":${DB_PORT}|:${NODE_PORT}" || info "none — ports appear free"
-
-# -------------------------
-# 2) START node now (manual-style) and wait for bind
-# -------------------------
-info "STEP 2: Starting node now (manual run) and waiting for it to bind ${NODE_PORT}"
-
-if ss -ltnp | grep -q ":${NODE_PORT}"; then
-  info "Node already listening on ${NODE_PORT}."
-else
-  if [ ! -x "${NODE_RUN}" ]; then
-    err "Node run script not found or not executable at ${NODE_RUN}. Aborting."
-    exit 2
-  fi
-
-  info "Starting node with ${NODE_RUN} (background, logs -> /var/log/demos-node.out)"
-  nohup "${NODE_RUN}" >/var/log/demos-node.out 2>&1 & disown || {
-    err "Failed to start node with ${NODE_RUN}."
-    exit 3
-  }
-
-  info "Waiting up to ${WAIT_BIND}s for node to bind ${NODE_PORT}..."
-  for i in $(seq 1 ${WAIT_BIND}); do
-    if ss -ltnp | grep -q ":${NODE_PORT}"; then
-      info "Node is listening on ${NODE_PORT}."
-      break
-    fi
-    sleep 1
-  done
-
-  if ! ss -ltnp | grep -q ":${NODE_PORT}"; then
-    err "Node did not bind ${NODE_PORT} within ${WAIT_BIND}s. Check /var/log/demos-node.out"
-    exit 4
-  fi
+if ! ss -ltnp | grep -q ":${NODE_PORT}"; then
+  err "Node did not bind ${NODE_PORT} within ${WAIT_BIND}s. Check /var/log/demos-node.out"
+  exit 7
 fi
 
 # -------------------------
-# 3) Wait for node-created Postgres container and set restart policy
+# 3) Wait for Postgres container and set restart policy
 # -------------------------
 info "STEP 3: Waiting for Postgres container (created by node) and setting restart policy"
 
@@ -184,7 +141,7 @@ for i in $(seq 1 ${WAIT_DB}); do
 done
 
 if [ -z "${CIDS}" ]; then
-  warn "No Postgres container detected after ${WAIT_DB}s. The node may create it later; you can run this script again or set restart policy manually after the container appears."
+  warn "No Postgres container detected after ${WAIT_DB}s. The node may create it later."
 else
   info "Setting Docker restart policy to unless-stopped for Postgres container(s)."
   echo "${CIDS}" | while read -r cid; do
@@ -194,57 +151,22 @@ else
 fi
 
 # -------------------------
-# 4) Recreate minimal systemd unit and enable for future boots (do NOT start now)
+# 4) Re-enable systemd unit for future boots
 # -------------------------
-info "STEP 4: Recreating minimal systemd unit and enabling it for future boots"
-
-cat > "${UNIT_PATH}" <<'UNIT'
-[Unit]
-Description=Demos Node Service
-After=network.target docker.service
-Requires=docker.service
-
-[Service]
-Type=simple
-WorkingDirectory=/opt/demos-node
-ExecStart=/opt/demos-node/run
-Restart=on-failure
-RestartSec=5
-EnvironmentFile=/opt/demos-node/.env
-TimeoutStopSec=60
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-chmod 644 "${UNIT_PATH}" || true
-systemctl daemon-reload
+info "STEP 4: Re-enabling systemd unit for future boots"
 systemctl enable "${UNIT}" >/dev/null 2>&1 || warn "systemctl enable returned non-zero"
 
-info "Systemd unit ${UNIT} written to ${UNIT_PATH} and enabled for future boots (it was NOT started now to avoid duplicate process)."
+info "Systemd unit ${UNIT} is enabled for autostart on boot."
 
 # -------------------------
 # 5) Final summary
 # -------------------------
 info "RESTART SEQUENCE COMPLETE"
-info "Node is running now (manual process)."
+info "Node is running now under systemd."
 if [ -n "${CIDS}" ]; then
   info "Postgres container(s) are present and configured to restart unless-stopped."
 else
   warn "Postgres container not detected; node may create it later."
 fi
-
-if [ "${PRE_ENABLED:-0}" -eq 1 ]; then
-  info "Note: the unit ${UNIT} was enabled before; it has been recreated and enabled for future boots."
-else
-  info "A minimal ${UNIT} unit file was created and enabled for future boots."
-fi
-
-info "If you want systemd to manage the node immediately (take over the running process), stop the manual process and start the unit:"
-info "  sudo pkill -f '/opt/demos-node/run' || true"
-info "  sudo systemctl start ${UNIT}"
-
-info "To revert Docker autostart for Postgres containers now:"
-info "  sudo docker ps --filter name=${DB_NAME_FILTER} --format '{{.ID}}' | xargs -r -n1 sudo docker update --restart=no"
 
 exit 0
