@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# stop_demos_node_v1.sh
+# stop_demos_node_v2.sh
 # Location: demos-installer-v2/
 #
 # Purpose:
 #   - Stop the node (whether managed by systemd or running as a stray process).
-#   - Remove systemd unit and drop-ins completely so the system looks like it never had a unit.
+#   - Disable/mask the systemd unit but keep the unit file intact for restart.
 #   - Stop, disable autostart, and remove Postgres Docker container(s) publishing DB_PORT.
 #   - Wait for ports to free.
 #   - Print clear guidance for restoring later.
@@ -56,7 +56,6 @@ detect_db_cids(){
 # -----------------------------
 msg "Stopping node process (systemd-managed or stray)..."
 
-# If systemd unit exists, stop it
 if systemctl list-unit-files --type=service --all | grep -q "^${UNIT}"; then
   if systemctl is-active --quiet "${UNIT}"; then
     msg "Systemd unit ${UNIT} is active: stopping..."
@@ -96,17 +95,17 @@ else
 fi
 
 # -----------------------------
-# 2) Remove systemd unit files and drop-ins completely
+# 2) Disable/mask systemd unit (leave unit file intact)
 # -----------------------------
-if [ -f "${UNIT_PATH}" ] || [ -d "${DROPIN_DIR}" ]; then
-  msg "Removing systemd unit file and drop-ins for ${UNIT}"
-  rm -f "${UNIT_PATH}" || true
-  rm -rf "${DROPIN_DIR}" || true
+if systemctl list-unit-files --type=service --all | grep -q "^${UNIT}"; then
+  msg "Disabling and masking systemd unit ${UNIT} (unit file will remain on disk)..."
+  systemctl disable "${UNIT}" >/dev/null 2>&1 || msg "systemctl disable returned non-zero"
+  systemctl mask "${UNIT}" >/dev/null 2>&1 || msg "systemctl mask returned non-zero"
   systemctl daemon-reload || true
   systemctl reset-failed || true
-  msg "Systemd unit files removed. Now 'systemctl status ${UNIT}' will show 'Unit not found'."
+  msg "Systemd unit ${UNIT} disabled/masked. The unit file is still present."
 else
-  msg "No unit file or drop-in directory to remove."
+  msg "No systemd unit ${UNIT} found on this host."
 fi
 
 # -----------------------------
@@ -150,7 +149,8 @@ if [ -n "$CIDS" ]; then
   msg "  cd /opt/demos-node/postgres_5332 && sudo docker compose up -d"
 fi
 
-msg "System now looks like there was never a systemd unit for ${UNIT}."
-msg "Check with: systemctl status ${UNIT}  # should say 'Unit ${UNIT} could not be found'"
+msg "Systemd unit ${UNIT} is still present but disabled/masked."
+msg "To restart the node under systemd, run:"
+msg "  sudo systemctl unmask ${UNIT} && sudo systemctl enable --now ${UNIT}"
 
 exit 0
