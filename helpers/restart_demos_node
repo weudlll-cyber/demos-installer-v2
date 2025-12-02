@@ -1,315 +1,250 @@
-#!/bin/bash
-# File: /opt/demos-node/helpers/restart_demos_node
-# restart_demos_node — node-first, safe restart flow with red messages
-# - Mask unit to avoid flapping
-# - Start node first
-# - If node needs DB and DB not reachable: start DB only if host port free
-# - Wait for DB TCP readiness, then probe node HTTP /health
-# - Restore unit enablement state
-# - Extra diagnostics and safer docker handling; conservative removal only when necessary
+#!/usr/bin/env bash
+# restart_demos_node.sh
+# Combined stop -> start -> enable-autostart flow
+# - Cleanly stop node (systemd-managed or stray), remove unit files and drop-ins
+# - Stop/remove DB container(s) publishing DB_PORT and disable Docker autostart
+# - Start node now (same as manual ./run), wait for bind
+# - Wait for node-created Postgres container, set restart=unless-stopped
+# - Recreate minimal systemd unit for demos-node.service and enable it (does NOT start a second instance)
 set -euo pipefail
 IFS=$'\n\t'
 
 UNIT="demos-node.service"
-ENV="/opt/demos-node/.env"
-NODE_PORT=53550
+UNIT_PATH="/etc/systemd/system/${UNIT}"
+DROPIN_DIR="/etc/systemd/system/${UNIT}.d"
+NODE_RUN="/opt/demos-node/run"
+WORKDIR="/opt/demos-node"
+COMPOSE_DIR="/opt/demos-node/postgres_5332"
+DB_NAME_FILTER="postgres_5332"
 DB_PORT=5332
-DB_WAIT=30    # seconds to wait for DB TCP after attempting to start DB
-HTTP_WAIT=60  # seconds to wait for HTTP /health
-DB_CONTAINER_NAME="postgres_5332"  # container name the node expects
+NODE_PORT=53550
+WAIT_STOP=20
+WAIT_BIND=40
+WAIT_DB=60
 
-# small helpers (all messages printed in red)
-log(){ printf "\e[91m%s\e[0m\n" "$*"; }
+info(){ printf "\e[32m%s\e[0m\n" "$*"; }
+warn(){ printf "\e[33m%s\e[0m\n" "$*"; }
 err(){ printf "\e[91m%s\e[0m\n" "$*" >&2; }
 
-# read NODE_PORT override if present
-if [ -f "$ENV" ]; then
-  p=$(grep -m1 '^NODE_PORT=' "$ENV" | cut -d= -f2 || true)
-  [ -n "$p" ] && NODE_PORT="$p"
+if [ "$(id -u)" -ne 0 ]; then
+  err "Run this script as root (sudo)."
+  exit 1
 fi
 
-# prefer docker-compose stop/start when we can detect the DB container publishing DB_PORT
-detect_db_cid(){
-  command -v docker >/dev/null 2>&1 || return 0
-  docker ps --format '{{.ID}}\t{{.Names}}\t{{.Ports}}' | awk -v p=":${DB_PORT}->" '$0 ~ p { print $1; exit }'
+# -------------------------
+# Helper: detect DB container IDs publishing DB_PORT
+# -------------------------
+detect_db_cids(){
+  command -v docker >/dev/null 2>&1 || return 1
+  docker ps --format '{{.ID}}\t{{.Ports}}\t{{.Names}}' | awk -v p=":${DB_PORT}->" '$0 ~ p { print $1 }'
 }
 
-wait_tcp(){
-  # wait for 127.0.0.1:$1 to accept TCP connections up to $2 seconds
-  local port=$1 timeout=${2:-10} elapsed=0
-  while [ $elapsed -lt $timeout ]; do
-    if bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/${port}" >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 1; elapsed=$((elapsed+1))
-  done
-  return 1
-}
+# -------------------------
+# 1) STOP / CLEAN
+# -------------------------
+info "STEP 1: Stopping node and cleaning systemd + Docker autostart"
 
-http_probe(){
-  # probe loopback and return 0 on success
-  local timeout=${1:-30} elapsed=0
-  while [ $elapsed -lt $timeout ]; do
-    if curl -fsS -m 3 "http://127.0.0.1:${NODE_PORT}/health" >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 1; elapsed=$((elapsed+1))
-  done
-  return 1
-}
-
-docker_available(){
-  command -v docker >/dev/null 2>&1
-}
-
-docker_container_exists(){
-  local name="$1"
-  docker_available || return 1
-  docker ps -a --format '{{.Names}}' | grep -qx "$name"
-}
-
-docker_container_status(){
-  local name="$1"
-  docker_available || return 1
-  docker inspect --format '{{.State.Status}}' "$name" 2>/dev/null || echo ""
-}
-
-docker_try_start(){
-  local id="$1"
-  sudo docker start "$id" >/dev/null 2>&1 || return 1
-  return 0
-}
-
-docker_force_remove(){
-  local name="$1"
-  sudo docker rm -f "$name" >/dev/null 2>&1 || return 1
-  return 0
-}
-
-# small diagnostic helper to print system and docker state
-print_diagnostics(){
-  log "=== DIAGNOSTICS BEGIN ==="
-  log "Systemd unit status for ${UNIT}:"
-  sudo systemctl status "${UNIT}" --no-pager -l || true
-  log "Recent journal lines for ${UNIT}:"
-  sudo journalctl -u "${UNIT}" --no-pager -n 80 || true
-  if docker_available; then
-    log "Docker: list all containers (ps -a):"
-    sudo docker ps -a --format 'ID={{.ID}} Name={{.Names}} Status={{.Status}} Ports={{.Ports}}' || true
-    if docker_container_exists "${DB_CONTAINER_NAME}"; then
-      log "Docker: inspect ${DB_CONTAINER_NAME}:"
-      sudo docker inspect --format 'Name: {{.Name}} ID: {{.Id}} State: {{.State.Status}} RestartCount: {{.RestartCount}}' "${DB_CONTAINER_NAME}" 2>/dev/null || true
-      log "Docker: last 200 lines of ${DB_CONTAINER_NAME} logs:"
-      sudo docker logs --tail 200 "${DB_CONTAINER_NAME}" || true
-    else
-      log "Docker: no container named ${DB_CONTAINER_NAME} found"
-    fi
-  else
-    log "Docker not available on this host"
-  fi
-  log "=== DIAGNOSTICS END ==="
-}
-
-# BEGIN restart flow
-log "Masking ${UNIT} to prevent automatic restarts while we operate"
+# If unit exists, record enabled state
 PRE_ENABLED=0
-if systemctl is-enabled --quiet "${UNIT}" 2>/dev/null; then PRE_ENABLED=1; fi
-sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
+if systemctl list-unit-files --type=service --all | grep -q "^${UNIT}"; then
+  if systemctl is-enabled --quiet "${UNIT}" 2>/dev/null; then PRE_ENABLED=1; fi
+fi
 
-# 1) Check whether host DB port is already bound. If bound, do NOT attempt to start DB later.
-if ss -ltnp | grep -qE ":${DB_PORT}"; then
-  log "Host port ${DB_PORT} is already bound — will NOT attempt to start DB container (to avoid conflicts)"
-  SKIP_DB_START=1
+# Stop unit if active
+if systemctl list-unit-files --type=service --all | grep -q "^${UNIT}"; then
+  if systemctl is-active --quiet "${UNIT}"; then
+    info "Stopping systemd unit ${UNIT}..."
+    systemctl stop "${UNIT}" || warn "systemctl stop returned non-zero; continuing"
+  else
+    info "Systemd unit ${UNIT} not active."
+  fi
+
+  info "Masking and disabling ${UNIT} to prevent automatic restarts"
+  systemctl mask "${UNIT}" >/dev/null 2>&1 || true
+  systemctl disable "${UNIT}" >/dev/null 2>&1 || true
 else
-  SKIP_DB_START=0
+  info "Systemd unit ${UNIT} not present."
 fi
 
-# 2) Start the node service first (node-first policy)
-log "Unmasking and starting ${UNIT} (node-first)"
-sudo systemctl unmask "${UNIT}" >/dev/null 2>&1 || true
-sudo systemctl daemon-reload >/dev/null 2>&1 || true
-if ! sudo systemctl start "${UNIT}"; then
-  err "systemctl start failed; printing diagnostics and aborting"
-  print_diagnostics
-  sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
-  exit 1
-fi
-
-# show immediate status after start attempt
-log "systemctl status immediately after start attempt:"
-sudo systemctl status "${UNIT}" --no-pager -l || true
-log "tail of journal for ${UNIT} (last 40 lines):"
-sudo journalctl -u "${UNIT}" --no-pager -n 40 || true
-
-# 3) Wait for node HTTP /health briefly to see if node is already healthy
-log "Waiting up to ${HTTP_WAIT}s for HTTP /health on port ${NODE_PORT}"
-if http_probe "${HTTP_WAIT}"; then
-  log "Node responded to /health — restore enablement and finish"
-  if [ "${PRE_ENABLED}" -eq 1 ]; then
-    log "Restoring enablement: enabling ${UNIT}"
-    sudo systemctl enable --now "${UNIT}" >/dev/null 2>&1 || true
-  else
-    log "Leaving ${UNIT} disabled (was disabled before)"
+# Wait for systemd MainPID to exit (if any)
+for i in $(seq 1 $WAIT_STOP); do
+  PID=$(systemctl show -p MainPID --value "${UNIT}" 2>/dev/null || echo 0)
+  if [ -z "$PID" ] || [ "$PID" = "0" ]; then
+    break
   fi
-  log "Restart complete — node responsive"
-  exit 0
-fi
+  sleep 1
+done
 
-# 4) Node did not become healthy. Probe DB reachability now.
-log "Node not healthy yet — checking DB reachability on 127.0.0.1:${DB_PORT}"
-if wait_tcp "${DB_PORT}" 1; then
-  log "DB already reachable on ${DB_PORT}; giving node a bit more time to become healthy"
-  # give node a short grace period to become healthy
-  if http_probe 15; then
-    log "Node became healthy after DB was reachable"
-    if [ "${PRE_ENABLED}" -eq 1 ]; then
-      log "Restoring enablement: enabling ${UNIT}"
-      sudo systemctl enable --now "${UNIT}" >/dev/null 2>&1 || true
+# Kill stray node processes (bun or run script)
+info "Killing stray node processes (if any)..."
+STRAY_PIDS="$(pgrep -f 'bun -r tsconfig-paths/register src/index.ts' || true) $(pgrep -f '/opt/demos-node/run' || true) $(pgrep -f 'bun start:bun' || true)"
+STRAY_PIDS="$(echo "$STRAY_PIDS" | tr ' ' '\n' | awk 'NF' | sort -u || true)"
+if [ -n "$STRAY_PIDS" ]; then
+  echo "$STRAY_PIDS" | while read -r p; do
+    info "  - TERM $p"
+    kill -TERM "$p" 2>/dev/null || true
+  done
+  sleep 2
+  echo "$STRAY_PIDS" | while read -r p; do
+    if kill -0 "$p" 2>/dev/null; then
+      warn "PID $p still alive; KILLing"
+      kill -KILL "$p" 2>/dev/null || true
     fi
-    exit 0
-  fi
-  err "Node still not healthy despite DB reachable; check node logs: journalctl -u ${UNIT} -n 200"
-  sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
-  exit 1
-fi
-
-# 5) DB not reachable. If we previously detected host port bound, abort to avoid conflicts.
-if [ "${SKIP_DB_START}" -eq 1 ]; then
-  err "DB not reachable on ${DB_PORT} and host port ${DB_PORT} is in use. Aborting and leaving node masked for operator investigation."
-  print_diagnostics
-  sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
-  exit 2
-fi
-
-# 5.5) Guard against container name conflicts while being conservative
-if docker_available; then
-  log "Detecting DB container publishing port: calling detect_db_cid()"
-  CID=$(detect_db_cid || true)
-  log "detect_db_cid returned: ${CID:-<none>}"
-
-  if docker_container_exists "${DB_CONTAINER_NAME}"; then
-    STATUS=$(docker_container_status "${DB_CONTAINER_NAME}" || true)
-    log "Found container ${DB_CONTAINER_NAME} with status '${STATUS}'"
-    if [ "$STATUS" = "running" ]; then
-      log "${DB_CONTAINER_NAME} is running — will attempt to reuse it (no removal)"
-      if wait_tcp "${DB_PORT}" 1; then
-        log "Container ${DB_CONTAINER_NAME} is listening on ${DB_PORT}"
-      else
-        log "Container ${DB_CONTAINER_NAME} running but not listening on ${DB_PORT}; attempting restart"
-        if ! sudo docker restart "${DB_CONTAINER_NAME}" >/dev/null 2>&1; then
-          err "Failed to restart ${DB_CONTAINER_NAME}; attempting forced removal to allow recreate"
-          if ! docker_force_remove "${DB_CONTAINER_NAME}"; then
-            err "Failed to remove ${DB_CONTAINER_NAME}; printing diagnostics and aborting"
-            print_diagnostics
-            sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
-            exit 6
-          fi
-        fi
-      fi
-    else
-      log "${DB_CONTAINER_NAME} exists with status '${STATUS}' — attempting to start it"
-      if ! docker_try_start "${DB_CONTAINER_NAME}"; then
-        log "Starting ${DB_CONTAINER_NAME} failed; removing stale container to allow fresh create"
-        if ! docker_force_remove "${DB_CONTAINER_NAME}"; then
-          err "Failed to remove stale ${DB_CONTAINER_NAME}; printing diagnostics and aborting"
-          print_diagnostics
-          sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
-          exit 7
-        fi
-      else
-        log "Started existing container ${DB_CONTAINER_NAME}; giving it a moment to bind port"
-        sleep 2
-      fi
-    fi
-  else
-    log "No container named ${DB_CONTAINER_NAME} exists locally"
-  fi
+  done
 else
-  log "Docker not available; will attempt other DB start methods if present"
-  CID=""
+  info "No stray node processes found."
 fi
 
-# 6) DB not reachable and host port free — attempt to start DB container (compose preferred)
-log "DB not reachable and host port free — attempting to start DB container (compose preferred)"
-CID=${CID:-$(detect_db_cid || true)}
-log "Using CID (if any): ${CID:-<none>}"
-
-if [ -n "$CID" ]; then
-  PROJECT=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}' "$CID" 2>/dev/null || true)
-  SERVICE_LABEL=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.service" }}' "$CID" 2>/dev/null || true)
-  log "docker inspect labels: project='${PROJECT}' service='${SERVICE_LABEL}'"
-  if [ -n "$PROJECT" ] && [ -n "$SERVICE_LABEL" ] && docker_available && docker compose version >/dev/null 2>&1 2>/dev/null; then
-    log "Using docker compose for project ${PROJECT}, service ${SERVICE_LABEL}"
-    if [ -d "/opt/demos-node/${PROJECT}" ]; then
-      log "Running: (cd /opt/demos-node/${PROJECT} && sudo docker compose -p ${PROJECT} up -d ${SERVICE_LABEL})"
-      (cd "/opt/demos-node/${PROJECT}" 2>/dev/null || true; sudo docker compose -p "$PROJECT" up -d "$SERVICE_LABEL") || sudo docker compose -p "$PROJECT" up -d || true
-    else
-      log "Running: sudo docker compose -p ${PROJECT} up -d ${SERVICE_LABEL}"
-      sudo docker compose -p "$PROJECT" up -d "$SERVICE_LABEL" || sudo docker compose -p "$PROJECT" up -d || true
-    fi
-  else
-    # try to start the container by ID if present, else try to start the named container
-    if [ -n "$CID" ]; then
-      log "Attempting to start container ID ${CID}"
-      sudo docker update --restart=no "$CID" >/dev/null 2>&1 || true
-      sudo docker start "$CID" >/dev/null 2>&1 || true
-    else
-      log "No CID found; attempting to start container named ${DB_CONTAINER_NAME} if present"
-      if docker_available && docker_container_exists "${DB_CONTAINER_NAME}"; then
-        sudo docker start "${DB_CONTAINER_NAME}" >/dev/null 2>&1 || true
-      else
-        if [ -d /opt/demos-node/postgres_5332 ] && docker_available && docker compose version >/dev/null 2>&1 2>/dev/null; then
-          log "No running DB container found; using docker compose in /opt/demos-node/postgres_5332 to start DB"
-          sudo bash -lc 'cd /opt/demos-node/postgres_5332 && docker compose up -d' || true
-        else
-          err "No DB container found and no compose project available to start DB. Aborting."
-          sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
-          exit 3
-        fi
-      fi
-    fi
-  fi
+# Remove systemd unit file and drop-ins (complete cleanup)
+if [ -f "${UNIT_PATH}" ] || [ -d "${DROPIN_DIR}" ]; then
+  info "Removing systemd unit file and drop-ins for ${UNIT}"
+  rm -f "${UNIT_PATH}" || true
+  rm -rf "${DROPIN_DIR}" || true
+  systemctl daemon-reload || true
+  systemctl reset-failed || true
+  info "Systemd unit files removed and daemon reloaded."
 else
-  # no container currently publishing DB_PORT; try compose dir if present
-  if [ -d /opt/demos-node/postgres_5332 ] && docker_available && docker compose version >/dev/null 2>&1 2>/dev/null; then
-    log "No running DB container found; using docker compose in /opt/demos-node/postgres_5332 to start DB"
-    sudo bash -lc 'cd /opt/demos-node/postgres_5332 && docker compose up -d' || true
-  else
-    err "No DB container found and no compose project available to start DB. Aborting."
-    sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
+  info "No unit file or drop-in directory to remove."
+fi
+
+# Detect and stop/remove DB container(s)
+CIDS="$(detect_db_cids || true)"
+if [ -n "$CIDS" ]; then
+  info "Found container(s) publishing host port ${DB_PORT}:"
+  echo "$CIDS" | while read -r cid; do
+    info "  - ${cid} : set restart=no, stop and remove"
+    docker update --restart=no "$cid" >/dev/null 2>&1 || warn "docker update failed for $cid"
+    docker stop --time 10 "$cid" >/dev/null 2>&1 || warn "docker stop failed for $cid"
+    docker rm -f "$cid" >/dev/null 2>&1 || warn "docker rm failed for $cid"
+  done
+else
+  info "No container publishing host port ${DB_PORT} detected; skipping container stop/removal."
+fi
+
+# Wait for ports to free
+info "Waiting up to ${WAIT_STOP}s for node and DB ports to free..."
+for i in $(seq 1 $WAIT_STOP); do
+  if ! ss -ltnp | grep -E ":${DB_PORT}|:${NODE_PORT}" >/dev/null; then
+    break
+  fi
+  sleep 1
+done
+
+info "Listening sockets for ${DB_PORT} and ${NODE_PORT}:"
+ss -ltnp | grep -E ":${DB_PORT}|:${NODE_PORT}" || info "none — ports appear free"
+
+# -------------------------
+# 2) START node now (manual-style) and wait for bind
+# -------------------------
+info "STEP 2: Starting node now (manual run) and waiting for it to bind ${NODE_PORT}"
+
+if ss -ltnp | grep -q ":${NODE_PORT}"; then
+  info "Node already listening on ${NODE_PORT}."
+else
+  if [ ! -x "${NODE_RUN}" ]; then
+    err "Node run script not found or not executable at ${NODE_RUN}. Aborting."
+    exit 2
+  fi
+
+  info "Starting node with ${NODE_RUN} (background, logs -> /var/log/demos-node.out)"
+  nohup "${NODE_RUN}" >/var/log/demos-node.out 2>&1 & disown || {
+    err "Failed to start node with ${NODE_RUN}."
     exit 3
+  }
+
+  info "Waiting up to ${WAIT_BIND}s for node to bind ${NODE_PORT}..."
+  for i in $(seq 1 ${WAIT_BIND}); do
+    if ss -ltnp | grep -q ":${NODE_PORT}"; then
+      info "Node is listening on ${NODE_PORT}."
+      break
+    fi
+    sleep 1
+  done
+
+  if ! ss -ltnp | grep -q ":${NODE_PORT}"; then
+    err "Node did not bind ${NODE_PORT} within ${WAIT_BIND}s. Check /var/log/demos-node.out"
+    exit 4
   fi
 fi
 
-# 7) Wait for DB to accept TCP connections
-log "Waiting up to ${DB_WAIT}s for DB TCP on 127.0.0.1:${DB_PORT}"
-if ! wait_tcp "${DB_PORT}" "${DB_WAIT}"; then
-  err "DB did not become reachable within ${DB_WAIT}s. Check DB container logs and node logs."
-  if docker_available; then
-    log "Recent DB container logs (tail 200):"
-    docker ps -a --filter name="${DB_CONTAINER_NAME}" --format '{{.ID}}' | xargs -r -I{} sudo docker logs --tail 200 {} || true
+# -------------------------
+# 3) Wait for node-created Postgres container and set restart policy
+# -------------------------
+info "STEP 3: Waiting for Postgres container (created by node) and setting restart policy"
+
+CIDS=""
+for i in $(seq 1 ${WAIT_DB}); do
+  CIDS="$(docker ps --filter name="${DB_NAME_FILTER}" --format '{{.ID}}' || true)"
+  if [ -n "${CIDS}" ]; then
+    info "Found Postgres container(s):"
+    echo "${CIDS}" | while read -r cid; do info "  - ${cid}"; done
+    break
   fi
-  journalctl -u "${UNIT}" --no-pager -n 120 || true
-  sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
-  exit 4
-fi
+  sleep 1
+done
 
-# 8) DB reachable — wait a short moment and probe node HTTP /health again
-log "DB reachable — giving node ${HTTP_WAIT}s to become healthy"
-if ! http_probe "${HTTP_WAIT}"; then
-  err "Node did not respond to HTTP /health after DB became reachable; check node logs"
-  journalctl -u "${UNIT}" --no-pager -n 200 || true
-  sudo systemctl mask "${UNIT}" >/dev/null 2>&1 || true
-  exit 5
-fi
-
-# restore enablement to previous state
-if [ "${PRE_ENABLED}" -eq 1 ]; then
-  log "Restoring enablement: enabling ${UNIT}"
-  sudo systemctl enable --now "${UNIT}" >/dev/null 2>&1 || true
+if [ -z "${CIDS}" ]; then
+  warn "No Postgres container detected after ${WAIT_DB}s. The node may create it later; you can run this script again or set restart policy manually after the container appears."
 else
-  log "Leaving ${UNIT} disabled (was disabled before)"
+  info "Setting Docker restart policy to unless-stopped for Postgres container(s)."
+  echo "${CIDS}" | while read -r cid; do
+    docker update --restart=unless-stopped "${cid}" >/dev/null 2>&1 || warn "docker update failed for ${cid}"
+    info "  - restart policy set for ${cid}"
+  done
 fi
 
-log "Restart complete — node responsive"
+# -------------------------
+# 4) Recreate minimal systemd unit and enable for future boots (do NOT start now)
+# -------------------------
+info "STEP 4: Recreating minimal systemd unit and enabling it for future boots"
+
+cat > "${UNIT_PATH}" <<'UNIT'
+[Unit]
+Description=Demos Node Service
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/demos-node
+ExecStart=/opt/demos-node/run
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=/opt/demos-node/.env
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+chmod 644 "${UNIT_PATH}" || true
+systemctl daemon-reload
+systemctl enable "${UNIT}" >/dev/null 2>&1 || warn "systemctl enable returned non-zero"
+
+info "Systemd unit ${UNIT} written to ${UNIT_PATH} and enabled for future boots (it was NOT started now to avoid duplicate process)."
+
+# -------------------------
+# 5) Final summary
+# -------------------------
+info "RESTART SEQUENCE COMPLETE"
+info "Node is running now (manual process)."
+if [ -n "${CIDS}" ]; then
+  info "Postgres container(s) are present and configured to restart unless-stopped."
+else
+  warn "Postgres container not detected; node may create it later."
+fi
+
+if [ "${PRE_ENABLED:-0}" -eq 1 ]; then
+  info "Note: the unit ${UNIT} was enabled before; it has been recreated and enabled for future boots."
+else
+  info "A minimal ${UNIT} unit file was created and enabled for future boots."
+fi
+
+info "If you want systemd to manage the node immediately (take over the running process), stop the manual process and start the unit:"
+info "  sudo pkill -f '/opt/demos-node/run' || true"
+info "  sudo systemctl start ${UNIT}"
+
+info "To revert Docker autostart for Postgres containers now:"
+info "  sudo docker ps --filter name=${DB_NAME_FILTER} --format '{{.ID}}' | xargs -r -n1 sudo docker update --restart=no"
+
 exit 0
