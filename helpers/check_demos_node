@@ -11,6 +11,7 @@ UNIT_NAME="${SERVICE_NAME}.service"
 
 # === Load .env variables and build HTTP endpoint ===
 ENV_FILE="/opt/demos-node/.env"
+PEERLIST_FILE="/opt/demos-node/demos_peerlist.json"
 NODE_PORT="53550"
 BASE_URL="http://127.0.0.1:$NODE_PORT"
 
@@ -41,6 +42,25 @@ BASE_URL=$(echo "$BASE_URL" | sed -E 's/:+/:/g')
 
 echo -e "\e[91m🔍 Starting full health check for Demos Node service: $SERVICE_NAME\e[0m"
 
+# === Show public key(s) from demos_peerlist.json ===
+if [ -f "$PEERLIST_FILE" ]; then
+  if command -v jq >/dev/null 2>&1; then
+    PUBKEYS=$(jq -r 'keys[]' "$PEERLIST_FILE" 2>/dev/null || echo "")
+    if [ -n "$PUBKEYS" ]; then
+      echo -e "\e[91m🔑 Node Public Keys from demos_peerlist.json:\e[0m"
+      echo "$PUBKEYS" | while read -r key; do
+        echo -e "\e[91m   • $key\e[0m"
+      done
+    else
+      echo -e "\e[91m⚠️ No keys found in $PEERLIST_FILE\e[0m"
+    fi
+  else
+    echo -e "\e[91m⚠️ jq not installed; cannot parse $PEERLIST_FILE\e[0m"
+  fi
+else
+  echo -e "\e[91m⚠️ Peerlist file $PEERLIST_FILE not found\e[0m"
+fi
+
 # === Pre-checks ===
 if ! command -v systemctl &>/dev/null; then
   echo -e "\e[91m❌ systemctl not found. This system may not support systemd.\e[0m"
@@ -56,40 +76,26 @@ if ! systemctl show "$UNIT_NAME" &>/dev/null; then
   echo -e "\e[91mTry:\e[0m"
   echo -e "\e[91msudo systemctl daemon-reload && sudo systemctl enable $UNIT_NAME && sudo systemctl start $UNIT_NAME\e[0m"
 else
-  # === Get systemd status and PID ===
   STATUS=$(systemctl is-active "$UNIT_NAME" || echo "unknown")
   PID=$(systemctl show -p MainPID "$UNIT_NAME" | cut -d= -f2 || echo 0)
   PID=${PID:-0}
 
   echo -e "\e[91m🧠 Systemd Status: $STATUS\e[0m"
   case "$STATUS" in
-    active)
-      echo -e "\e[91m✅ The service is running normally.\e[0m"
-      ;;
-    inactive)
-      echo -e "\e[91m⚠️ The service is installed but not running.\e[0m"
-      echo -e "\e[91mYou can start it with:\e[0m"
-      echo -e "\e[91msudo systemctl start $UNIT_NAME\e[0m"
-      ;;
-    failed)
-      echo -e "\e[91m❌ The service has crashed or failed to start.\e[0m"
-      echo -e "\e[91mRecent logs:\e[0m"
-      journalctl -u "$UNIT_NAME" --no-pager -n 20
-      echo -e "\e[91mYou can try restarting it:\e[0m"
-      echo -e "\e[91msudo systemctl restart $UNIT_NAME\e[0m"
-      ;;
-    activating)
-      echo -e "\e[91m⏳ The service is in the process of starting.\e[0m"
-      ;;
-    deactivating)
-      echo -e "\e[91m⏸️ The service is shutting down.\e[0m"
-      ;;
-    *)
-      echo -e "\e[91m❓ Unknown status: $STATUS\e[0m"
-      ;;
+    active) echo -e "\e[91m✅ The service is running normally.\e[0m" ;;
+    inactive) echo -e "\e[91m⚠️ The service is installed but not running.\e[0m"
+              echo -e "\e[91mYou can start it with:\e[0m"
+              echo -e "\e[91msudo systemctl start $UNIT_NAME\e[0m" ;;
+    failed) echo -e "\e[91m❌ The service has crashed or failed to start.\e[0m"
+            echo -e "\e[91mRecent logs:\e[0m"
+            journalctl -u "$UNIT_NAME" --no-pager -n 20
+            echo -e "\e[91mYou can try restarting it:\e[0m"
+            echo -e "\e[91msudo systemctl restart $UNIT_NAME\e[0m" ;;
+    activating) echo -e "\e[91m⏳ The service is in the process of starting.\e[0m" ;;
+    deactivating) echo -e "\e[91m⏸️ The service is shutting down.\e[0m" ;;
+    *) echo -e "\e[91m❓ Unknown status: $STATUS\e[0m" ;;
   esac
 
-  # === PID check ===
   if [[ "$PID" =~ ^[0-9]+$ ]] && [ "$PID" -gt 0 ]; then
     echo -e "\e[91m🧬 Main PID: $PID\e[0m"
     echo -e "\e[91m✅ The process is alive and tracked by systemd.\e[0m"
@@ -97,10 +103,8 @@ else
     echo -e "\e[91m⚠️ No active process found. The service may be stopped or failed.\e[0m"
   fi
 
-  # === HTTP endpoint check with fallback ===
   ENDPOINTS=( "/health" "/status" "/metrics" )
   RESPONSIVE=false
-
   for ep in "${ENDPOINTS[@]}"; do
     HTTP_ENDPOINT="${BASE_URL%/}$ep"
     echo -e "\e[91m🌐 Checking HTTP endpoint: $HTTP_ENDPOINT\e[0m"
