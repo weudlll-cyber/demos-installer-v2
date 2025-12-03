@@ -2,34 +2,33 @@
 # change_pubkey.sh
 #
 # Purpose:
-#   - Stop the node cleanly using the existing stop script.
-#   - Prompt the user for a peer public key and connection string.
-#   - Add that peer entry to demos_peerlist.json.
-#   - Restart the node under systemd and wait for it to bind.
+#   - Stop the node by fetching and executing the official stop script.
+#   - Prompt for peer public key and connection string.
+#   - Update demos_peerlist.json with the new peer.
+#   - Restart the node under systemd and wait for bind.
 #
 # Notes:
 #   - All output is printed in RED for consistency.
-#   - Script is idempotent: safe to run multiple times.
 #   - Run with sudo/root privileges.
 
 set -euo pipefail
 IFS=$'\n\t'
 
 # -----------------------------
-# Configuration variables
+# Configuration
 # -----------------------------
-STOP_SCRIPT="/opt/demos-node/helpers/stop_demos_node.sh"   # Path to your stop script
-WORKDIR="/opt/demos-node"                                  # Node working directory
-PEERLIST_PATH="${WORKDIR}/demos_peerlist.json"             # Peerlist file
-UNIT="demos-node.service"                                  # Systemd unit name
-NODE_PORT=53550                                            # Node RPC port
-WAIT_BIND=40                                               # Seconds to wait for bind
+STOP_URL="https://raw.githubusercontent.com/weudlll-cyber/demos-installer-v2/main/stop_demos_node_v1.sh"
+WORKDIR="/opt/demos-node"
+PEERLIST_PATH="${WORKDIR}/demos_peerlist.json"
+UNIT="demos-node.service"
+NODE_PORT=53550
+WAIT_BIND=40
 
 # -----------------------------
-# Helper functions
+# Output helpers (all red)
 # -----------------------------
-msg(){  printf "\e[31m%s\e[0m\n" "$*"; }     # Print messages in RED
-err(){  printf "\e[31m%s\e[0m\n" "$*" >&2; } # Print errors in RED to stderr
+msg(){  printf "\e[31m%s\e[0m\n" "$*"; }
+err(){  printf "\e[31m%s\e[0m\n" "$*" >&2; }
 
 # -----------------------------
 # Root check
@@ -40,27 +39,25 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # -----------------------------
-# 1) Stop node using stop script
+# 1) Stop node using remote stop script
 # -----------------------------
-msg "STEP 1: Stopping node using ${STOP_SCRIPT}"
-if [ -x "${STOP_SCRIPT}" ]; then
-  "${STOP_SCRIPT}"
-else
-  err "❌ Stop script not found or not executable at ${STOP_SCRIPT}"
+msg "STEP 1: Stopping node using remote stop script"
+curl -fsSL "$STOP_URL" | bash || {
+  err "❌ Failed to execute stop script from $STOP_URL"
   exit 2
-fi
+}
 
 # -----------------------------
-# 2) Prompt user for peer info
+# 2) Prompt for peer info
 # -----------------------------
-msg "STEP 2: Please enter the peer's public key (e.g. 0xd0b2be2cb6d...)"
+msg "STEP 2: Enter the peer's public key (e.g. 0xd0b2be2cb6d...)"
 read -r PUBKEY
 if [ -z "${PUBKEY}" ]; then
   err "❌ No public key entered. Aborting."
   exit 3
 fi
 
-msg "STEP 2: Please enter the peer's connection string (e.g. http://peer.example:53550)"
+msg "STEP 2: Enter the peer's connection string (e.g. http://peer.example:53550)"
 read -r CONNSTR
 if [ -z "${CONNSTR}" ]; then
   err "❌ No connection string entered. Aborting."
@@ -72,15 +69,12 @@ fi
 # -----------------------------
 msg "STEP 3: Updating ${PEERLIST_PATH} with new peer entry"
 
-# If file exists, merge entry; if not, create new JSON object
 if [ -f "${PEERLIST_PATH}" ]; then
-  # Use jq if available for safe JSON update
   if command -v jq >/dev/null 2>&1; then
     tmpfile="$(mktemp)"
     jq --arg k "${PUBKEY}" --arg v "${CONNSTR}" '. + {($k): $v}' "${PEERLIST_PATH}" > "$tmpfile"
     mv "$tmpfile" "${PEERLIST_PATH}"
   else
-    # Fallback: overwrite with single-entry JSON (not ideal, but ensures peerlist exists)
     echo "{ \"${PUBKEY}\": \"${CONNSTR}\" }" > "${PEERLIST_PATH}"
   fi
 else
@@ -97,7 +91,6 @@ systemctl unmask "${UNIT}" >/dev/null 2>&1 || true
 systemctl daemon-reload
 systemctl restart "${UNIT}"
 
-# Wait for bind
 msg "Waiting up to ${WAIT_BIND}s for node to bind ${NODE_PORT}..."
 for i in $(seq 1 ${WAIT_BIND}); do
   if ss -ltnp | grep -q ":${NODE_PORT}"; then
