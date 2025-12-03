@@ -1,172 +1,188 @@
 #!/usr/bin/env bash
 # restart_demos_node.sh
-# Stop -> restart -> re-enable flow
-# - Cleanly stop node (systemd-managed or stray), disable/mask unit
-# - Stop/remove DB container(s) publishing DB_PORT
-# - Ensure dependencies are installed
-# - Restart node under systemd and wait for bind
-# - Wait for node-created Postgres container, set restart=unless-stopped
-# - Re-enable systemd unit for autostart
+#
+# Purpose:
+#   - Cleanly stop the node (systemd-managed or stray).
+#   - Disable/mask the systemd unit (but do not delete the unit file).
+#   - Stop/remove Postgres Docker container(s) publishing DB_PORT.
+#   - Ensure Bun dependencies are installed (requires package.json).
+#   - Restart node under systemd and wait for it to bind NODE_PORT.
+#   - Wait for node-created Postgres container and set restart policy.
+#   - Re-enable systemd unit for autostart on future boots.
+#
+# Notes:
+#   - All user-facing output is printed in RED for consistency.
+#   - Script is idempotent: safe to run multiple times.
+#   - Run with sudo/root privileges.
 
 set -euo pipefail
 IFS=$'\n\t'
 
-UNIT="demos-node.service"
-UNIT_PATH="/etc/systemd/system/${UNIT}"
-WORKDIR="/opt/demos-node"
-DB_NAME_FILTER="postgres_5332"
-DB_PORT=5332
-NODE_PORT=53550
-WAIT_STOP=20
-WAIT_BIND=40
-WAIT_DB=60
+# -----------------------------
+# Configuration variables
+# -----------------------------
+UNIT="demos-node.service"                    # Name of the systemd unit
+UNIT_PATH="/etc/systemd/system/${UNIT}"      # Path to the unit file
+WORKDIR="/opt/demos-node"                    # Node working directory
+DB_NAME_FILTER="postgres_5332"               # Docker container name filter
+DB_PORT=5332                                 # Postgres host port
+NODE_PORT=53550                              # Node RPC port
+WAIT_STOP=20                                 # Seconds to wait for processes to stop
+WAIT_BIND=40                                 # Seconds to wait for node to bind
+WAIT_DB=60                                   # Seconds to wait for DB container
 
-info(){ printf "\e[32m%s\e[0m\n" "$*"; }
-warn(){ printf "\e[33m%s\e[0m\n" "$*"; }
-err(){ printf "\e[91m%s\e[0m\n" "$*" >&2; }
+# -----------------------------
+# Helper functions
+# -----------------------------
+msg(){ printf "\e[91m%s\e[0m\n" "$*"; }      # Print all messages in RED
+err(){ printf "\e[91m%s\e[0m\n" "$*" >&2; }  # Print errors in RED to stderr
 
+# Root check
 if [ "$(id -u)" -ne 0 ]; then
-  err "Run this script as root (sudo)."
+  err "❌ Run this script as root (sudo)."
   exit 1
 fi
 
-# -------------------------
-# Helper: detect DB container IDs publishing DB_PORT
-# -------------------------
+# Detect DB containers publishing DB_PORT
 detect_db_cids(){
   command -v docker >/dev/null 2>&1 || return 1
   docker ps --format '{{.ID}}\t{{.Ports}}\t{{.Names}}' | awk -v p=":${DB_PORT}->" '$0 ~ p { print $1 }'
 }
 
-# -------------------------
+# -----------------------------
 # 1) STOP / CLEAN
-# -------------------------
-info "STEP 1: Stopping node and cleaning systemd + Docker autostart"
+# -----------------------------
+msg "STEP 1: Stopping node and cleaning systemd + Docker autostart"
 
+# Stop systemd unit if present
 if systemctl list-unit-files --type=service --all | grep -q "^${UNIT}"; then
   if systemctl is-active --quiet "${UNIT}"; then
-    info "Stopping systemd unit ${UNIT}..."
-    systemctl stop "${UNIT}" || warn "systemctl stop returned non-zero; continuing"
+    msg "Stopping systemd unit ${UNIT}..."
+    systemctl stop "${UNIT}" || msg "⚠️ systemctl stop returned non-zero; continuing"
   else
-    info "Systemd unit ${UNIT} not active."
+    msg "Systemd unit ${UNIT} not active."
   fi
 
-  info "Masking and disabling ${UNIT} to prevent automatic restarts"
+  msg "Masking and disabling ${UNIT} to prevent automatic restarts"
   systemctl mask "${UNIT}" >/dev/null 2>&1 || true
   systemctl disable "${UNIT}" >/dev/null 2>&1 || true
 else
-  info "Systemd unit ${UNIT} not present."
+  msg "Systemd unit ${UNIT} not present."
 fi
 
-# Kill stray node processes
-info "Killing stray node processes (if any)..."
+# Kill stray node processes (bun or run script)
+msg "Killing stray node processes (if any)..."
 STRAY_PIDS="$(pgrep -f '/opt/demos-node/run' || true)"
 if [ -n "$STRAY_PIDS" ]; then
   echo "$STRAY_PIDS" | while read -r p; do
-    info "  - TERM $p"
+    msg "  - TERM $p"
     kill -TERM "$p" 2>/dev/null || true
   done
   sleep 2
   echo "$STRAY_PIDS" | while read -r p; do
     if kill -0 "$p" 2>/dev/null; then
-      warn "PID $p still alive; KILLing"
+      msg "⚠️ PID $p still alive; KILLing"
       kill -KILL "$p" 2>/dev/null || true
     fi
   done
 else
-  info "No stray node processes found."
+  msg "No stray node processes found."
 fi
 
 # Stop/remove DB containers
 CIDS="$(detect_db_cids || true)"
 if [ -n "$CIDS" ]; then
-  info "Found container(s) publishing host port ${DB_PORT}:"
+  msg "Found container(s) publishing host port ${DB_PORT}:"
   echo "$CIDS" | while read -r cid; do
-    info "  - ${cid} : set restart=no, stop and remove"
-    docker update --restart=no "$cid" >/dev/null 2>&1 || warn "docker update failed for $cid"
-    docker stop --time 10 "$cid" >/dev/null 2>&1 || warn "docker stop failed for $cid"
-    docker rm -f "$cid" >/dev/null 2>&1 || warn "docker rm failed for $cid"
+    msg "  - ${cid} : set restart=no, stop and remove"
+    docker update --restart=no "$cid" >/dev/null 2>&1 || msg "⚠️ docker update failed for $cid"
+    docker stop --time 10 "$cid" >/dev/null 2>&1 || msg "⚠️ docker stop failed for $cid"
+    docker rm -f "$cid" >/dev/null 2>&1 || msg "⚠️ docker rm failed for $cid"
   done
 else
-  info "No container publishing host port ${DB_PORT} detected; skipping container stop/removal."
+  msg "No container publishing host port ${DB_PORT} detected; skipping container stop/removal."
 fi
 
-# -------------------------
+# -----------------------------
 # 2) Ensure dependencies and restart node under systemd
-# -------------------------
-info "STEP 2: Ensuring dependencies and restarting node under systemd"
+# -----------------------------
+msg "STEP 2: Ensuring dependencies and restarting node under systemd"
 
+# Verify package.json exists
 if [ ! -f "${WORKDIR}/package.json" ]; then
-  err "Missing package.json in ${WORKDIR}. Cannot install dependencies or start node."
+  err "❌ Missing package.json in ${WORKDIR}. Cannot install dependencies or start node."
   exit 5
 fi
 
-info "Running bun install in ${WORKDIR}..."
+# Run bun install
+msg "Running bun install in ${WORKDIR}..."
 cd "${WORKDIR}"
-bun install || { err "bun install failed"; exit 6; }
+bun install || { err "❌ bun install failed"; exit 6; }
 
-info "Restarting systemd unit ${UNIT}..."
+# Restart systemd unit
+msg "Restarting systemd unit ${UNIT}..."
 systemctl unmask "${UNIT}" >/dev/null 2>&1 || true
 systemctl daemon-reload
 systemctl restart "${UNIT}"
 
-info "Waiting up to ${WAIT_BIND}s for node to bind ${NODE_PORT}..."
+# Wait for bind
+msg "Waiting up to ${WAIT_BIND}s for node to bind ${NODE_PORT}..."
 for i in $(seq 1 ${WAIT_BIND}); do
   if ss -ltnp | grep -q ":${NODE_PORT}"; then
-    info "Node is listening on ${NODE_PORT}."
+    msg "✅ Node is listening on ${NODE_PORT}."
     break
   fi
   sleep 1
 done
 
 if ! ss -ltnp | grep -q ":${NODE_PORT}"; then
-  err "Node did not bind ${NODE_PORT} within ${WAIT_BIND}s. Check /var/log/demos-node.out"
+  err "❌ Node did not bind ${NODE_PORT} within ${WAIT_BIND}s. Check /var/log/demos-node.out"
   exit 7
 fi
 
-# -------------------------
+# -----------------------------
 # 3) Wait for Postgres container and set restart policy
-# -------------------------
-info "STEP 3: Waiting for Postgres container (created by node) and setting restart policy"
+# -----------------------------
+msg "STEP 3: Waiting for Postgres container (created by node) and setting restart policy"
 
 CIDS=""
 for i in $(seq 1 ${WAIT_DB}); do
   CIDS="$(docker ps --filter name="${DB_NAME_FILTER}" --format '{{.ID}}' || true)"
   if [ -n "${CIDS}" ]; then
-    info "Found Postgres container(s):"
-    echo "${CIDS}" | while read -r cid; do info "  - ${cid}"; done
+    msg "Found Postgres container(s):"
+    echo "${CIDS}" | while read -r cid; do msg "  - ${cid}"; done
     break
   fi
   sleep 1
 done
 
 if [ -z "${CIDS}" ]; then
-  warn "No Postgres container detected after ${WAIT_DB}s. The node may create it later."
+  msg "⚠️ No Postgres container detected after ${WAIT_DB}s. The node may create it later."
 else
-  info "Setting Docker restart policy to unless-stopped for Postgres container(s)."
+  msg "Setting Docker restart policy to unless-stopped for Postgres container(s)."
   echo "${CIDS}" | while read -r cid; do
-    docker update --restart=unless-stopped "${cid}" >/dev/null 2>&1 || warn "docker update failed for ${cid}"
-    info "  - restart policy set for ${cid}"
+    docker update --restart=unless-stopped "${cid}" >/dev/null 2>&1 || msg "⚠️ docker update failed for ${cid}"
+    msg "  - restart policy set for ${cid}"
   done
 fi
 
-# -------------------------
+# -----------------------------
 # 4) Re-enable systemd unit for future boots
-# -------------------------
-info "STEP 4: Re-enabling systemd unit for future boots"
-systemctl enable "${UNIT}" >/dev/null 2>&1 || warn "systemctl enable returned non-zero"
+# -----------------------------
+msg "STEP 4: Re-enabling systemd unit for future boots"
+systemctl enable "${UNIT}" >/dev/null 2>&1 || msg "⚠️ systemctl enable returned non-zero"
 
-info "Systemd unit ${UNIT} is enabled for autostart on boot."
+msg "✅ Systemd unit ${UNIT} is enabled for autostart on boot."
 
-# -------------------------
+# -----------------------------
 # 5) Final summary
-# -------------------------
-info "RESTART SEQUENCE COMPLETE"
-info "Node is running now under systemd."
+# -----------------------------
+msg "RESTART SEQUENCE COMPLETE"
+msg "✅ Node is running now under systemd."
 if [ -n "${CIDS}" ]; then
-  info "Postgres container(s) are present and configured to restart unless-stopped."
+  msg "✅ Postgres container(s) are present and configured to restart unless-stopped."
 else
-  warn "Postgres container not detected; node may create it later."
+  msg "⚠️ Postgres container not detected; node may create it later."
 fi
 
 exit 0
