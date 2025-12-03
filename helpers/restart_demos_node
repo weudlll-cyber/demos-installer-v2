@@ -34,9 +34,9 @@ WAIT_DB=60                                   # Seconds to wait for DB container
 # -----------------------------
 # Helper functions
 # -----------------------------
-msg(){  printf "\e[91m%s\e[0m\n" "$*"; }     # Print normal messages in RED
-warn(){ printf "\e[91m%s\e[0m\n" "$*"; }     # Print warnings in RED
-err(){  printf "\e[91m%s\e[0m\n" "$*" >&2; } # Print errors in RED to stderr
+msg(){  printf "\e[31m%s\e[0m\n" "$*"; }     # Print normal messages in RED
+warn(){ printf "\e[31m%s\e[0m\n" "$*"; }     # Print warnings in RED
+err(){  printf "\e[31m%s\e[0m\n" "$*" >&2; } # Print errors in RED to stderr
 
 # Root check
 if [ "$(id -u)" -ne 0 ]; then
