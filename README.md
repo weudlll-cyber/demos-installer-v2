@@ -32,6 +32,10 @@ curl -fsSL "https://raw.githubusercontent.com/weudlll-cyber/demos-installer-v2/m
 Stop demos node and make a clone of it
 ```bash
 curl -fsSL "https://raw.githubusercontent.com/weudlll-cyber/demos-installer-v2/main/stop_demos_node_v1.sh" -o /tmp/stop_demos_node_v1.sh && chmod +x /tmp/stop_demos_node_v1.sh && sudo /tmp/stop_demos_node_v1.sh
+```
+Change the public key (input of the key necessary)
+```bash
+curl -fsSL https://raw.githubusercontent.com/weudlll-cyber/demos-installer-v2/main/change_pubkey.sh | bash
 ``` 
 
 
