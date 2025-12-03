@@ -3,8 +3,8 @@
 #
 # Purpose:
 #   - Stop the node by fetching and executing the official stop script.
-#   - Prompt ONLY for the peer public key (address).
-#   - Add that peer entry to demos_peerlist.json using the address itself as the connection string.
+#   - Prompt ONLY once for the peer public key/address.
+#   - Add that entry to demos_peerlist.json (merge with existing JSON).
 #   - Restart the node under systemd and wait for bind.
 #
 # Notes:
@@ -36,31 +36,29 @@ curl -fsSL "$STOP_URL" | bash || {
   exit 2
 }
 
-# 2) Prompt ONLY for peer public key/address
-msg "STEP 2: Enter the peer's public key/address (e.g. http://peer.example:53550)"
-read -r PUBKEY
-if [ -z "${PUBKEY}" ]; then
+# 2) Prompt ONCE for peer public key/address
+msg "STEP 2: Enter the peer's public key/address (e.g. 0xd0b2be2cb6d... or http://peer.example:53550)"
+read -r ADDR
+if [ -z "${ADDR}" ]; then
   err "❌ No address entered. Aborting."
   exit 3
 fi
 
-# Use the entered address directly as the connection string
-CONNSTR="${PUBKEY}"
-
-# 3) Update demos_peerlist.json
+# 3) Update demos_peerlist.json (merge with existing JSON)
 msg "STEP 3: Updating ${PEERLIST_PATH} with new peer entry"
 if [ -f "${PEERLIST_PATH}" ]; then
   if command -v jq >/dev/null 2>&1; then
     tmpfile="$(mktemp)"
-    jq --arg k "${PUBKEY}" --arg v "${CONNSTR}" '. + {($k): $v}' "${PEERLIST_PATH}" > "$tmpfile"
+    jq --arg k "${ADDR}" --arg v "${ADDR}" '. + {($k): $v}' "${PEERLIST_PATH}" > "$tmpfile"
     mv "$tmpfile" "${PEERLIST_PATH}"
   else
-    echo "{ \"${PUBKEY}\": \"${CONNSTR}\" }" > "${PEERLIST_PATH}"
+    # Fallback: overwrite with single-entry JSON if jq not available
+    echo "{ \"${ADDR}\": \"${ADDR}\" }" > "${PEERLIST_PATH}"
   fi
 else
-  echo "{ \"${PUBKEY}\": \"${CONNSTR}\" }" > "${PEERLIST_PATH}"
+  echo "{ \"${ADDR}\": \"${ADDR}\" }" > "${PEERLIST_PATH}"
 fi
-msg "✅ Added peer ${PUBKEY} -> ${CONNSTR}"
+msg "✅ Added peer ${ADDR} -> ${ADDR}"
 
 # 4) Restart node under systemd
 msg "STEP 4: Restarting node under systemd"
@@ -85,6 +83,6 @@ fi
 
 # 5) Final summary
 msg "CHANGE PUBKEY SEQUENCE COMPLETE"
-msg "✅ Node restarted with new peer entry: ${PUBKEY} -> ${CONNSTR}"
+msg "✅ Node restarted with new peer entry: ${ADDR} -> ${ADDR}"
 
 exit 0
