@@ -35,7 +35,7 @@ curl -fsSL "https://raw.githubusercontent.com/weudlll-cyber/demos-installer-v2/m
 ```
 Change the public key (input of the key necessary)
 ```bash
-curl -fsSL https://raw.githubusercontent.com/weudlll-cyber/demos-installer-v2/main/change_pubkey.sh | bash
+curl -fsSL https://raw.githubusercontent.com/weudlll-cyber/demos-installer-v2/main/change_pubkey.sh -o change_pubkey.sh && chmod +x change_pubkey.sh && sudo ./change_pubkey.sh
 ``` 
 
 
