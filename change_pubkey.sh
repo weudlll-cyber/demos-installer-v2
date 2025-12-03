@@ -3,8 +3,8 @@
 #
 # Purpose:
 #   - Stop the node by fetching and executing the official stop script.
-#   - Prompt for peer public key and connection string.
-#   - Update demos_peerlist.json with the new peer.
+#   - Prompt ONLY for the peer public key.
+#   - Add that peer entry to demos_peerlist.json with a default connection string.
 #   - Restart the node under systemd and wait for bind.
 #
 # Notes:
@@ -48,7 +48,7 @@ curl -fsSL "$STOP_URL" | bash || {
 }
 
 # -----------------------------
-# 2) Prompt for peer info
+# 2) Prompt ONLY for peer public key
 # -----------------------------
 msg "STEP 2: Enter the peer's public key (e.g. 0xd0b2be2cb6d...)"
 read -r PUBKEY
@@ -57,12 +57,8 @@ if [ -z "${PUBKEY}" ]; then
   exit 3
 fi
 
-msg "STEP 2: Enter the peer's connection string (e.g. http://peer.example:53550)"
-read -r CONNSTR
-if [ -z "${CONNSTR}" ]; then
-  err "❌ No connection string entered. Aborting."
-  exit 4
-fi
+# Use a default connection string format (localhost + node port)
+CONNSTR="http://localhost:${NODE_PORT}"
 
 # -----------------------------
 # 3) Update demos_peerlist.json
